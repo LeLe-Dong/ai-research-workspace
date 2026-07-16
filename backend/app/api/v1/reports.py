@@ -9,6 +9,20 @@ from app.db.models import Artifact, Research, Review
 router = APIRouter(prefix="/researches", tags=["reports"])
 
 
+def _extract_executive_summary(md: str) -> str:
+    """Extract Executive Summary section from a markdown report. Falls back to first 1500 chars."""
+    import re as _re
+    if not md:
+        return ""
+    m = _re.search(
+        r"(?ims)^##\s+(?:1\.\s*Executive Summary|Executive Summary)\s*\n(.*?)(?=^##\s+|\Z)",
+        md,
+    )
+    if m:
+        return f"## 1. Executive Summary\n\n{m.group(1).strip()}"
+    return md[:1500]
+
+
 @router.get("/{research_id}/report")
 async def report(research_id: str, session: AsyncSession = Depends(get_session_dep)):
     r = (await session.execute(
@@ -26,6 +40,7 @@ async def report(research_id: str, session: AsyncSession = Depends(get_session_d
     )).scalar_one_or_none()
 
     by_kind = {a.kind: a for a in artifacts}
+    full_md = by_kind.get("markdown").content if by_kind.get("markdown") else None
 
     return {
         "research": {
@@ -37,11 +52,11 @@ async def report(research_id: str, session: AsyncSession = Depends(get_session_d
             "updated_at": r.updated_at.isoformat(),
         },
         "sections": {
-            "executive_summary": by_kind.get("markdown").content if by_kind.get("markdown") else None,
+            "executive_summary": _extract_executive_summary(full_md) if full_md else None,
             "research_flow_diagram": by_kind.get("mermaid").content if by_kind.get("mermaid") else None,
             "comparison_table": by_kind.get("table").content if by_kind.get("table") else None,
         },
-        "full_report": by_kind.get("markdown").content if by_kind.get("markdown") else None,
+        "full_report": full_md,
         "review": _build_review_payload(review) if review else None,
     }
 
