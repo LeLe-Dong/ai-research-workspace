@@ -1,6 +1,12 @@
-"""Web search via DuckDuckGo (free, no API key)."""
+"""Web search via MiniMax (primary) or DDGS (fallback).
+
+Primary: MiniMax web_search API — Chinese-first, high quality, requires AIRW_MINIMAX_API_KEY.
+Fallback: DDGS DuckDuckGo — free, no API key, often blocked in China.
+"""
 import logging
+import os
 from dataclasses import dataclass
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -12,8 +18,53 @@ class SearchHit:
     snippet: str
 
 
+class MiniMaxSearch:
+    """Calls api.minimaxi.com/v1/coding_plan/search (web_search MCP tool)."""
+
+    def __init__(
+        self,
+        api_key: str = "",
+        base_url: str = "https://api.minimaxi.com",
+        max_results: int = 5,
+        timeout: float = 10.0,
+    ):
+        self.api_key = api_key or os.getenv("AIRW_MINIMAX_API_KEY", "")
+        self.base_url = base_url or os.getenv("AIRW_MINIMAX_BASE_URL", "https://api.minimaxi.com")
+        self.max_results = max_results
+        self.timeout = timeout
+
+    def search(self, query: str) -> list[SearchHit]:
+        if not self.api_key:
+            logger.debug("MiniMax API key not set")
+            return []
+        try:
+            r = httpx.post(
+                f"{self.base_url}/v1/coding_plan/search",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "MM-API-Source": "Minimax-MCP",
+                    "Content-Type": "application/json",
+                },
+                json={"q": query},
+                timeout=self.timeout,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            logger.warning("MiniMax search failed for %r: %s", query, e)
+            return []
+        hits: list[SearchHit] = []
+        for item in (data.get("organic") or [])[: self.max_results]:
+            hits.append(SearchHit(
+                title=item.get("title", "")[:200],
+                url=item.get("link", ""),
+                snippet=item.get("snippet", "")[:500],
+            ))
+        return hits
+
+
 class DDGSSearch:
-    """Wraps ddgs. Falls back gracefully on transient errors."""
+    """Wraps ddgs. Free, no API key, often blocked in China."""
 
     def __init__(self, max_results: int = 5):
         self.max_results = max_results
@@ -25,7 +76,7 @@ class DDGSSearch:
             logger.error("ddgs not installed")
             return []
         try:
-            with DDGS() as ddgs:
+            with DDGS(timeout=8) as ddgs:
                 results = list(ddgs.text(query, max_results=self.max_results))
             return [
                 SearchHit(
@@ -38,6 +89,44 @@ class DDGSSearch:
         except Exception as e:
             logger.warning("DDGS search failed for %r: %s", query, e)
             return []
+
+
+class WebSearcher:
+    """Tries MiniMax first, falls back to DDGS. Never raises — always returns a list."""
+
+    def __init__(self, max_results: int = 5, prefer: str = "minimax"):
+        self.max_results = max_results
+        self.prefer = prefer
+        self._minimax = MiniMaxSearch(max_results=max_results)
+        self._ddgs = DDGSSearch(max_results=max_results)
+
+    def search(self, query: str) -> list[SearchHit]:
+        """Returns search results. Tries MiniMax → DDGS → empty list."""
+        if self.prefer in ("minimax", "auto"):
+            hits = self._minimax.search(query)
+            if hits:
+                return hits
+            if self.prefer == "minimax":
+                logger.debug("MiniMax returned empty, trying DDGS")
+                hits = self._ddgs.search(query)
+                return hits
+        if self.prefer in ("ddgs", "auto"):
+            hits = self._ddgs.search(query)
+            if hits:
+                return hits
+            if self.prefer == "auto":
+                return self._minimax.search(query)
+        return []
+
+    @property
+    def backend(self) -> str:
+        """Returns which backend is configured ('minimax' or 'ddgs')."""
+        return "minimax" if self._minimax.api_key else "ddgs"
+
+    # Pass-through methods for backward compatibility
+    def __getattr__(self, name):
+        # Forward unknown attribute access to DDGSSearch for legacy code
+        return getattr(self._ddgs, name)
 
     def search_many(self, queries: list[str]) -> list[tuple[str, SearchHit]]:
         """Returns [(query, hit), ...] deduplicated by URL."""

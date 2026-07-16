@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     stepfun_model: str = "step-3.7-flash"
     stepfun_base_url: str = "https://api.stepfun.com/step_plan/v1"
 
+    # MiniMax (web_search API — Chinese-first search)
+    minimax_api_key: str = ""
+    minimax_base_url: str = "https://api.minimaxi.com"
+
     # Hermes Researcher (shell out hermes chat --cli)
     hermes_bin: str = "/root/.local/bin/hermes"
     hermes_profile: str = "researcher"  # pre-research expert

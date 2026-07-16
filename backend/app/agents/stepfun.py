@@ -16,7 +16,7 @@ from typing import AsyncIterator
 
 from app.agents.base import AgentClient, AgentEvent, ResearchRequest
 from app.agents.llm import StepfunClient, LLMError, _strip_thinking
-from app.agents.search import DDGSSearch
+from app.agents.search import DDGSSearch, WebSearcher, MiniMaxSearch
 from app.agents.prompts import (
     UNDERSTAND_SYSTEM, UNDERSTAND_USER_TEMPLATE,
     RESEARCH_SYSTEM, RESEARCH_USER_TEMPLATE,
@@ -108,9 +108,22 @@ class StepfunAgentClient(AgentClient):
         api_key: str,
         model: str = "step-3.7-flash",
         base_url: str = "https://api.stepfun.com/step_plan/v1",
+        minimax_api_key: str = "",
+        minimax_base_url: str = "https://api.minimaxi.com",
     ):
         self.llm = StepfunClient(api_key=api_key, base_url=base_url, model=model)
-        self.searcher = DDGSSearch(max_results=4)
+        # WebSearcher tries MiniMax first, falls back to DDGS
+        self.searcher = WebSearcher(
+            max_results=4,
+            prefer="minimax" if minimax_api_key else "ddgs",
+        )
+        # Wire MiniMax backend with API key (or fall back to DDGS)
+        self.searcher._minimax = MiniMaxSearch(
+            api_key=minimax_api_key,
+            base_url=minimax_base_url,
+            max_results=4,
+        )
+        logger.info("search backend: %s", self.searcher.backend)
 
     async def run_research(self, req: ResearchRequest) -> AsyncIterator[AgentEvent]:
         # 1) Task tree (UI consistency)
@@ -162,9 +175,10 @@ class StepfunAgentClient(AgentClient):
                              detail="", task_id="task-00", task_progress=100)
 
             # Phase 2: RESEARCH
+            search_backend_name = "MiniMax 中文搜索" if self.searcher.backend == "minimax" else "DuckDuckGo"
             yield AgentEvent(phase="search", level="info",
                              title=f"检索网络：{len(search_queries)} 个查询",
-                             detail="使用 DuckDuckGo（无需 API key）",
+                             detail=f"使用 {search_backend_name}（{'需 API key' if self.searcher.backend == 'minimax' else '无需 API key'}）",
                              task_id="task-01", task_progress=0)
             hits = self.searcher.search_many(search_queries)
             yield AgentEvent(phase="search", level="info",

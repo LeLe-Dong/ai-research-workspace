@@ -34,6 +34,8 @@ def get_agent_client() -> AgentClient:
             api_key=api_key,
             model=settings.stepfun_model,
             base_url=settings.stepfun_base_url,
+            minimax_api_key=settings.minimax_api_key,
+            minimax_base_url=settings.minimax_base_url,
         )
     
     if mode == "hermes-researcher":

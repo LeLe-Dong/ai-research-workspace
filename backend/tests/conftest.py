@@ -2,6 +2,13 @@
 import sys
 import os
 
+# Load .env so AIRW_* keys are available in tests
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # default: loads .env in current dir
+except ImportError:
+    pass
+
 TEST_DB_PATH = "/tmp/airw_pytest_test.db"
 # Don't delete at start - we'll use a separate test DB file per test session
 
