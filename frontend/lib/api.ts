@@ -1,7 +1,8 @@
 // API base: env override, or relative paths (works behind reverse proxy).
 // When behind nginx, leave NEXT_PUBLIC_API_BASE unset and /api/* will hit the same origin.
 // For local dev without proxy, set NEXT_PUBLIC_API_BASE=http://127.0.0.1:8003
-export const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "";
+// Cache-bust: force-new-hash-2026-07-16-1500
+export const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "") as string;
 
 export class ApiError extends Error {
   constructor(public status: number, public body: string, message: string) {
@@ -10,9 +11,12 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
+  // Cache buster 2026-07-16: ensure all clients get fresh chunks
+  const url = `${API_BASE}${path}`;
+  const res = await fetch(url, {
     ...init,
     headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
+    cache: "no-store",
   });
   if (!res.ok) {
     const body = await res.text();
