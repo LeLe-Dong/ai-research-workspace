@@ -38,6 +38,7 @@ export interface Report {
   };
   sections: ReportSection;
   full_report?: string | null;
+  is_truncated?: boolean;
   review: ReportReview | null;
 }
 
@@ -55,4 +56,5 @@ export interface CompletedResearch {
 export const reportApi = {
   get: (id: string) => api.get<Report>(`/api/v1/researches/${id}/report`),
   listCompleted: () => api.get<CompletedResearch[]>("/api/v1/completed-researches"),
+  regenerate: (id: string) => api.post<{ok: boolean; chars: number; version: number}>(`/api/v1/researches/${id}/regenerate-report`),
 };

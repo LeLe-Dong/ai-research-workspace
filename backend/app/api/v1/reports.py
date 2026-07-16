@@ -40,7 +40,8 @@ async def report(research_id: str, session: AsyncSession = Depends(get_session_d
     )).scalar_one_or_none()
 
     by_kind = {a.kind: a for a in artifacts}
-    full_md = by_kind.get("markdown").content if by_kind.get("markdown") else None
+    raw_md = by_kind.get("markdown").content if by_kind.get("markdown") else None
+    clean_md = _get_clean_content(raw_md)
 
     return {
         "research": {
@@ -52,11 +53,12 @@ async def report(research_id: str, session: AsyncSession = Depends(get_session_d
             "updated_at": r.updated_at.isoformat(),
         },
         "sections": {
-            "executive_summary": _extract_executive_summary(full_md) if full_md else None,
+            "executive_summary": _extract_executive_summary(clean_md) if clean_md else None,
             "research_flow_diagram": by_kind.get("mermaid").content if by_kind.get("mermaid") else None,
             "comparison_table": by_kind.get("table").content if by_kind.get("table") else None,
         },
-        "full_report": full_md,
+        "full_report": clean_md,
+        "is_truncated": _is_truncated(raw_md),
         "review": _build_review_payload(review) if review else None,
     }
 
@@ -94,6 +96,23 @@ def _build_review_payload(review) -> dict:
     }
 
 
+
+
+def _is_truncated(content):
+    """Detect if report was truncated by max_tokens during generation."""
+    if not content:
+        return False
+    return "[truncated" in content or "[truncated: max_tokens reached]" in content
+
+
+def _get_clean_content(content):
+    """Strip the [truncated: max_tokens reached] marker from a report."""
+    if not content:
+        return ""
+    import re as _re
+    return _re.sub(r"\s*\[truncated[^\]]*\]\s*", "\n", content).strip()
+
+
 async def list_completed(session: AsyncSession = Depends(get_session_dep), limit: int = 50):
     """All completed researches (registered at /api/v1/completed-researches)."""
     from app.core.cache import TTLCache
@@ -127,3 +146,102 @@ async def list_completed(session: AsyncSession = Depends(get_session_dep), limit
         return out
 
     return await completed_cache.get_or_set(f"completed_{limit}", _compute, ttl=10.0)
+
+
+
+@router.post("/{research_id}/regenerate-report")
+async def regenerate_report(
+    research_id: str,
+    session: AsyncSession = Depends(get_session_dep),
+) -> dict:
+    """Re-run only the report phase for a completed research.
+
+    Useful when the original report was truncated by max_tokens. Bumps the
+    version on the new artifact, replaces the old markdown/mermaid/table artifacts.
+    Returns the new full_report markdown.
+    """
+    from app.agents.stepfun import StepfunAgentClient
+    from app.core.config import settings
+    from app.agents.prompts import (
+        UNDERSTAND_SYSTEM, UNDERSTAND_USER_TEMPLATE,
+        ANALYZE_SYSTEM, ANALYZE_USER_TEMPLATE,
+        REPORT_SYSTEM, REPORT_USER_TEMPLATE,
+    )
+    from app.db.models import Research as _R, Artifact as _A
+
+    if not settings.stepfun_api_key:
+        raise HTTPException(503, "stepfun API key not configured")
+
+    r = (await session.execute(
+        select(_R).where(_R.id == research_id)
+    )).scalar_one_or_none()
+    if r is None:
+        raise HTTPException(404, "Research not found")
+
+    # Get existing artifacts to find findings + analysis
+    arts = (await session.execute(
+        select(_A).where(_A.research_id == research_id).order_by(_A.created_at)
+    )).scalars().all()
+    by_kind = {a.kind: a for a in arts}
+    findings = by_kind.get("findings")
+    analysis = by_kind.get("analysis")
+
+    # For older researches without findings/analysis artifacts, fall back to the existing markdown
+    if not findings:
+        existing_md = by_kind.get("markdown")
+        if existing_md and existing_md.content:
+            findings = existing_md  # use existing markdown as base
+        else:
+            raise HTTPException(400, "No findings or markdown artifact to base report on")
+
+    client = StepfunAgentClient(
+        api_key=settings.stepfun_api_key,
+        model=settings.stepfun_model,
+        base_url=settings.stepfun_base_url,
+    )
+
+    # Re-run only the report phase
+    report_md = ""
+    try:
+        report_md = await client.llm.chat(
+            REPORT_SYSTEM,
+            REPORT_USER_TEMPLATE.format(
+                title=r.title, goal=r.goal,
+                constraints=r.constraints or "(none)",
+                expected_output=r.expected_output or "(none)",
+                findings=findings.content[:4000],
+                analysis=(analysis.content[:2000] if analysis else ""),
+                images="(skip — re-running with limited context)",
+            ),
+            max_tokens=16000,
+        )
+    except Exception as e:
+        raise HTTPException(502, f"Regenerate failed: {e}")
+
+    import json as _json
+    report_md = report_md.strip()
+
+    # Bump version on existing markdown artifact, replace content
+    md_art = by_kind.get("markdown")
+    if md_art is not None:
+        md_art.content = report_md
+        md_art.version += 1
+        session.add(md_art)
+    else:
+        session.add(_A(
+            research_id=research_id,
+            kind="markdown",
+            title="Final Report",
+            content=report_md,
+            version=1,
+        ))
+
+    await session.commit()
+
+    return {
+        "ok": True,
+        "research_id": research_id,
+        "version": (md_art.version if md_art else 1),
+        "chars": len(report_md),
+        "full_report": report_md,
+    }

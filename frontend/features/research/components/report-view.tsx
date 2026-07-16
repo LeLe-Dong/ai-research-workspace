@@ -16,9 +16,10 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Separator } from "@/components/ui/separator";
 import { lazy, Suspense } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { REVIEW_DIMENSION_LABELS } from "@/lib/labels";
+import { reportApi } from "../api-report";
 import type { Report, ReportSection } from "../api-report";
 import type { TaskNode } from "@/lib/types";
 
@@ -222,6 +223,23 @@ export function ReportView({ report }: { report: Report }) {
     refetchInterval: 5000,
   });
   const [tab, setTab] = useState("summary");
+  const [regenerating, setRegenerating] = useState(false);
+  const queryClient = useQueryClient();
+  const onRegenerate = async () => {
+    if (regenerating) return;
+    if (!confirm("重新生成报告会调用 LLM（消耗 token），确定继续？")) return;
+    setRegenerating(true);
+    try {
+      await reportApi.regenerate(report.research.id);
+      // Invalidate the report query to refetch
+      queryClient.invalidateQueries({ queryKey: ["report", report.research.id] });
+      queryClient.invalidateQueries({ queryKey: ["research-report", report.research.id] });
+    } catch (e) {
+      alert(`重新生成失败: ${(e as Error).message}`);
+    } finally {
+      setRegenerating(false);
+    }
+  };
   const review = report.review;
   const sections = report.sections;
   const overall = review?.overall_score ?? 0;
@@ -263,6 +281,35 @@ export function ReportView({ report }: { report: Report }) {
             <ReportStats sections={sections} reportMarkdown={fullMarkdown} />
           </CardContent>
         </Card>
+
+        {/* Truncation warning + regenerate */}
+        {report.is_truncated && (
+          <Card className="border-orange-500/40 bg-orange-500/5">
+            <CardContent className="py-4">
+              <div className="flex items-start gap-3">
+                <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-orange-600" />
+                <div className="flex-1 space-y-2">
+                  <p className="text-sm font-medium text-orange-700 dark:text-orange-300">
+                    报告在生成时被 LLM 的 token 限制截断，内容不完整
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    点击下方按钮重新生成完整报告（会调用 LLM 一次，约 30-60 秒）。
+                  </p>
+                  <Button
+                    size="sm"
+                    variant="default"
+                    disabled={regenerating}
+                    onClick={onRegenerate}
+                    className="mt-1"
+                  >
+                    <RotateCcw className={"mr-1.5 h-3.5 w-3.5 " + (regenerating ? "animate-spin" : "")} />
+                    {regenerating ? "正在重新生成..." : "重新生成完整报告"}
+                  </Button>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        )}
 
         {/* Verdict banner */}
         {review?.verdict && (
