@@ -64,3 +64,173 @@
   ::-webkit-scrollbar-thumb { background: hsl(var(--border)); border-radius: 4px; }
   ::-webkit-scrollbar-thumb:hover { background: hsl(var(--muted-foreground)); }
 }
+
+/* ============================================================
+   Report prose — long-form research report typography
+   Optimized for Chinese text (12-section, 8000+ char reports)
+   ============================================================ */
+.report-prose {
+  @apply text-foreground;
+  font-size: 15px;
+  line-height: 1.85;
+  color: hsl(var(--foreground));
+  max-width: none;
+}
+
+/* H1 - top of document (rare) */
+.report-prose .report-h1 {
+  @apply text-3xl font-bold tracking-tight border-b border-border pb-4 mb-6 mt-2;
+}
+
+/* H2 - section heading (most important) */
+.report-prose .report-h2 {
+  @apply text-2xl font-bold tracking-tight mt-12 mb-5 pt-6 border-t border-border/60;
+  scroll-margin-top: 80px; /* offset for fixed topbar when jumping */
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+}
+.report-prose .report-h2:first-of-type {
+  @apply mt-4 pt-2 border-t-0;
+}
+.report-prose .report-h2-badge {
+  @apply inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary text-sm font-bold;
+  font-feature-settings: "tnum";
+}
+.report-prose .report-h2-text {
+  @apply flex-1;
+}
+
+/* H3 - subsection */
+.report-prose .report-h3 {
+  @apply text-lg font-semibold mt-8 mb-3 tracking-tight;
+  scroll-margin-top: 80px;
+}
+
+/* H4 - sub-subsection */
+.report-prose h4 {
+  @apply text-base font-semibold mt-6 mb-2;
+}
+
+/* Paragraphs - generous breathing room */
+.report-prose .report-p {
+  @apply my-4 text-foreground/90;
+  line-height: 1.85;
+  letter-spacing: 0.005em;
+}
+
+/* Lists - proper indentation and spacing */
+.report-prose .report-ul,
+.report-prose .report-ol {
+  @apply my-4 pl-6 space-y-2;
+}
+.report-prose .report-ul {
+  list-style-type: disc;
+}
+.report-prose .report-ol {
+  list-style-type: decimal;
+}
+.report-prose .report-li {
+  @apply leading-relaxed pl-1.5;
+  line-height: 1.8;
+}
+.report-prose .report-li::marker {
+  color: hsl(var(--muted-foreground));
+}
+.report-prose li > p {
+  @apply my-1.5;
+}
+
+/* Nested lists */
+.report-prose li > ul,
+.report-prose li > ol {
+  @apply mt-2 mb-0;
+}
+
+/* Strong / emphasis */
+.report-prose .report-strong {
+  @apply font-semibold text-foreground;
+}
+
+/* Tables - publication-grade */
+.report-prose .report-table-wrap {
+  @apply my-6 overflow-x-auto rounded-lg border border-border bg-card;
+  -webkit-overflow-scrolling: touch;
+}
+.report-prose .report-table {
+  @apply w-full text-sm;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+.report-prose .report-thead {
+  @apply bg-muted/50;
+}
+.report-prose .report-th {
+  @apply px-4 py-3 text-left font-semibold text-foreground border-b border-border;
+  white-space: nowrap;
+}
+.report-prose .report-td {
+  @apply px-4 py-2.5 border-b border-border/60;
+  vertical-align: top;
+}
+.report-prose .report-tr:last-child .report-td {
+  border-bottom: none;
+}
+.report-prose .report-tbody .report-tr:hover {
+  @apply bg-muted/30;
+}
+.report-prose .report-tbody .report-tr:nth-child(even) {
+  @apply bg-muted/20;
+}
+
+/* Images - centered, with caption */
+.report-prose .report-img-wrap {
+  @apply block my-6;
+}
+.report-prose .report-img {
+  @apply max-w-full h-auto rounded-md border border-border/60 shadow-sm mx-auto;
+  display: block;
+}
+.report-prose .report-img-caption {
+  @apply block text-xs text-muted-foreground text-center mt-2 italic;
+}
+
+/* Horizontal rule - subtle separator */
+.report-prose .report-hr {
+  @apply my-10 border-border/40;
+}
+
+/* Blockquote - distinct from body */
+.report-prose .report-blockquote {
+  @apply my-5 pl-4 border-l-4 border-primary/40 bg-muted/20 py-3 pr-4 italic text-foreground/80 rounded-r;
+}
+
+/* Inline code */
+.report-prose .report-code {
+  @apply px-1.5 py-0.5 mx-0.5 rounded bg-muted text-foreground/90 font-mono text-[0.9em];
+}
+
+/* Code block */
+.report-prose .report-pre {
+  @apply my-5 p-4 rounded-md bg-zinc-950 text-zinc-100 overflow-x-auto text-xs leading-relaxed;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Consolas, monospace;
+}
+
+/* Links */
+.report-prose .report-a {
+  @apply text-primary underline underline-offset-2 decoration-primary/40 hover:decoration-primary;
+  word-break: break-word;
+}
+
+/* HR as section divider */
+.report-prose hr {
+  @apply my-10;
+}
+
+/* Strong lists with bullets */
+.report-prose ul.contains-task-list {
+  @apply pl-6;
+}
+.report-prose input[type="checkbox"] {
+  @apply mr-2;
+}
