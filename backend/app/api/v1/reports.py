@@ -1,0 +1,87 @@
+"""Report assembly: combines artifacts + review into a structured report."""
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.database import get_session_dep
+from app.db.models import Artifact, Research, Review
+
+router = APIRouter(prefix="/researches", tags=["reports"])
+
+
+@router.get("/{research_id}/report")
+async def report(research_id: str, session: AsyncSession = Depends(get_session_dep)):
+    r = (await session.execute(
+        select(Research).where(Research.id == research_id)
+    )).scalar_one_or_none()
+    if r is None:
+        raise HTTPException(404, "Research not found")
+
+    artifacts = (await session.execute(
+        select(Artifact).where(Artifact.research_id == research_id).order_by(Artifact.created_at)
+    )).scalars().all()
+
+    review = (await session.execute(
+        select(Review).where(Review.research_id == research_id)
+    )).scalar_one_or_none()
+
+    by_kind = {a.kind: a for a in artifacts}
+
+    return {
+        "research": {
+            "id": r.id, "title": r.title, "goal": r.goal,
+            "constraints": r.constraints, "expected_output": r.expected_output,
+            "depth": r.depth, "priority": r.priority,
+            "status": r.status,
+            "created_at": r.created_at.isoformat(),
+            "updated_at": r.updated_at.isoformat(),
+        },
+        "sections": {
+            "executive_summary": by_kind.get("markdown").content if by_kind.get("markdown") else None,
+            "research_flow_diagram": by_kind.get("mermaid").content if by_kind.get("mermaid") else None,
+            "comparison_table": by_kind.get("table").content if by_kind.get("table") else None,
+        },
+        "review": {
+            "overall_score": review.overall_score if review else None,
+            "dimensions": review.dimensions if review else {},
+            "strengths": review.strengths if review else "",
+            "weaknesses": review.weaknesses if review else "",
+            "suggestions": review.suggestions if review else "",
+            "threshold": review.threshold if review else 7.0,
+        } if review else None,
+    }
+
+
+async def list_completed(session: AsyncSession = Depends(get_session_dep), limit: int = 50):
+    """All completed researches (registered at /api/v1/completed-researches)."""
+    from app.core.cache import TTLCache
+    completed_cache = TTLCache(default_ttl=10.0)
+
+    async def _compute():
+        from sqlalchemy.orm import selectinload
+        # Use selectinload to eager-load reviews in a single batch query
+        rows = (await session.execute(
+            select(Research)
+            .where(Research.status == "completed")
+            .options(selectinload(Research.reviews))
+            .order_by(Research.updated_at.desc())
+            .limit(limit)
+        )).scalars().all()
+
+        out = []
+        for r in rows:
+            # Pick the latest review (or first if available)
+            review = r.reviews[0] if r.reviews else None
+            out.append({
+                "id": r.id,
+                "title": r.title,
+                "goal": r.goal,
+                "depth": r.depth,
+                "priority": r.priority,
+                "score": review.overall_score if review else None,
+                "created_at": r.created_at.isoformat(),
+                "updated_at": r.updated_at.isoformat(),
+            })
+        return out
+
+    return await completed_cache.get_or_set(f"completed_{limit}", _compute, ttl=10.0)

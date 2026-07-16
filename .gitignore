@@ -1,0 +1,29 @@
+# Frontend
+node_modules/
+.next/
+out/
+*.log
+.env*.local
+
+# Backend
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+
+# Storage (runtime data)
+storage/airw.db
+storage/airw.db-journal
+storage/artifacts/*
+!storage/artifacts/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Misc
+*.swp
+*.bak
