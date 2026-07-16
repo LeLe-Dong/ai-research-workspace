@@ -5,6 +5,7 @@ import {
   ArrowLeft, Copy, Check, Download, FileText, GitBranch,
   BarChart3, CheckCircle2, AlertCircle, Sparkles, Loader2, Trophy,
   RotateCcw, Clock, Hash, List, TrendingUp, TrendingDown, Minus,
+  AlertTriangle, HelpCircle, ListChecks, Quote, BookOpen, MessageSquareWarning,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -82,23 +83,18 @@ function ReviewRadar({ dimensions, threshold }: { dimensions: Record<string, num
     return [cx + Math.cos(a) * dist, cy + Math.sin(a) * dist] as const;
   };
 
-  // Build polygon for current scores
   const scorePoints = keys.map((_, i) => point(i, dimensions[keys[i]]));
-  // Build polygon for threshold
   const thresholdPoints = keys.map((_, i) => point(i, threshold));
 
   return (
     <svg viewBox="0 0 200 200" className="h-48 w-full">
-      {/* Concentric circles */}
       {[2, 4, 6, 8, 10].map(v => (
         <circle key={v} cx={cx} cy={cy} r={(v / 10) * r} fill="none" stroke="currentColor" className="text-muted" strokeOpacity={0.2} />
       ))}
-      {/* Axes */}
       {keys.map((_, i) => {
         const [x, y] = point(i, 10);
         return <line key={i} x1={cx} y1={cy} x2={x} y2={y} stroke="currentColor" className="text-muted" strokeOpacity={0.3} />;
       })}
-      {/* Threshold polygon (dashed) */}
       <polygon
         points={thresholdPoints.map(p => p.join(",")).join(" ")}
         fill="none"
@@ -107,7 +103,6 @@ function ReviewRadar({ dimensions, threshold }: { dimensions: Record<string, num
         strokeWidth={1}
         strokeDasharray="3,3"
       />
-      {/* Score polygon */}
       <polygon
         points={scorePoints.map(p => p.join(",")).join(" ")}
         fill="currentColor"
@@ -115,11 +110,9 @@ function ReviewRadar({ dimensions, threshold }: { dimensions: Record<string, num
         stroke="currentColor"
         strokeWidth={2}
       />
-      {/* Score dots */}
       {scorePoints.map((p, i) => (
         <circle key={i} cx={p[0]} cy={p[1]} r={3} fill="currentColor" className="text-emerald-500" />
       ))}
-      {/* Labels */}
       {keys.map((k, i) => {
         const a = angle(i);
         const lr = r + 12;
@@ -135,20 +128,40 @@ function ReviewRadar({ dimensions, threshold }: { dimensions: Record<string, num
   );
 }
 
-// Report metadata: word count, reading time, sections count
+// Normalize a string-or-list field to a string list
+function asList(v: unknown): string[] {
+  if (!v) return [];
+  if (Array.isArray(v)) return v.filter(s => typeof s === "string" && s.trim());
+  if (typeof v === "string") {
+    // Split on common delimiters
+    const parts = v.split(/[；;。]/).map(s => s.trim()).filter(Boolean);
+    return parts.length > 0 ? parts : [v];
+  }
+  return [];
+}
+
+// Get the best available strengths/weaknesses list from review
+function getStrengths(review: Report["review"]): string[] {
+  if (!review) return [];
+  return asList(review.strengths_list || review.strengths);
+}
+function getWeaknesses(review: Report["review"]): string[] {
+  if (!review) return [];
+  return asList(review.weaknesses_list || review.weaknesses);
+}
+
+// Report metadata stats
 function ReportStats({ sections, reportMarkdown }: { sections: any; reportMarkdown?: string }) {
   const allText = (sections.executive_summary || "") + (sections.comparison_table || "") + (reportMarkdown || "");
-  const wordCount = allText.replace(/\s+/g, " ").trim().split(" ").length;
-  // Chinese-friendly: ~250 chars/min reading
   const charCount = allText.length;
   const readingMin = Math.max(1, Math.round(charCount / 400));
-  const sectionCount = Object.values(sections).filter(v => v && typeof v === "string" && v.trim()).length;
+  const sectionCount = (reportMarkdown?.match(/^##\s+\d+\.\s/gm) || []).length;
 
   return (
     <div className="grid grid-cols-3 gap-3 text-center">
       <div className="rounded-md border bg-muted/30 p-2">
-        <p className="text-2xl font-semibold">{wordCount}</p>
-        <p className="text-[10px] text-muted-foreground">词数</p>
+        <p className="text-2xl font-semibold">{charCount}</p>
+        <p className="text-[10px] text-muted-foreground">字符数</p>
       </div>
       <div className="rounded-md border bg-muted/30 p-2">
         <p className="text-2xl font-semibold">{readingMin}</p>
@@ -156,17 +169,18 @@ function ReportStats({ sections, reportMarkdown }: { sections: any; reportMarkdo
       </div>
       <div className="rounded-md border bg-muted/30 p-2">
         <p className="text-2xl font-semibold">{sectionCount}</p>
-        <p className="text-[10px] text-muted-foreground">已完成章节</p>
+        <p className="text-[10px] text-muted-foreground">章节</p>
       </div>
     </div>
   );
 }
 
-// TOC sidebar
-function TableOfContents({ sections, onNavigate }: { sections: ReportSection; onNavigate?: (id: string) => void }) {
+// TOC sidebar with all 5 tabs
+function TableOfContents({ sections, fullReport, onNavigate }: { sections: ReportSection; fullReport?: string | null; onNavigate?: (id: string) => void }) {
   const items: { id: string; tab: string; label: string; available: boolean }[] = [
     { id: "summary", tab: "summary", label: "Executive Summary", available: !!sections.executive_summary },
-    { id: "diagram", tab: "diagram", label: "Research Flow", available: !!sections.research_flow_diagram },
+    { id: "full", tab: "full", label: "完整报告（12 节）", available: !!fullReport },
+    { id: "diagram", tab: "diagram", label: "研究流程", available: !!sections.research_flow_diagram },
     { id: "compare", tab: "compare", label: "Candidate 对比", available: !!sections.comparison_table },
     { id: "review", tab: "review", label: "AI 评审", available: true },
   ];
@@ -213,12 +227,7 @@ export function ReportView({ report }: { report: Report }) {
   const overall = review?.overall_score ?? 0;
   const passed = review ? overall >= review.threshold : false;
 
-  // Get full markdown from sections
-  const fullMarkdown = useMemo(() => {
-    return [sections.executive_summary, sections.research_flow_diagram, sections.comparison_table]
-      .filter(Boolean)
-      .join("\n\n---\n\n");
-  }, [sections]);
+  const fullMarkdown = report.full_report || sections.executive_summary || "";
 
   return (
     <div className="grid gap-6 lg:grid-cols-[1fr_200px]">
@@ -239,7 +248,7 @@ export function ReportView({ report }: { report: Report }) {
                 </div>
                 <p className="mt-1 text-xs text-muted-foreground">
                   生成于 {new Date(report.research.updated_at).toLocaleString()} ·
-                  深度： {report.research.depth} · Priority： {report.research.priority}
+                  深度：{report.research.depth} · Priority：{report.research.priority}
                 </p>
               </div>
               {review && (
@@ -255,16 +264,17 @@ export function ReportView({ report }: { report: Report }) {
           </CardContent>
         </Card>
 
-        {!passed && review && (
-          <Card className="border-amber-500/30 bg-amber-500/5">
-            <CardContent className="py-4">
+        {/* Verdict banner */}
+        {review?.verdict && (
+          <Card className={passed ? "border-emerald-500/30 bg-emerald-500/5" : "border-amber-500/30 bg-amber-500/5"}>
+            <CardContent className="py-3">
               <div className="flex items-start gap-3">
-                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
-                <div className="flex-1 space-y-2">
-                  <p className="text-sm font-medium text-amber-700 dark:text-amber-300">
-                    报告评分未达阈值 {review.threshold.toFixed(1)}
+                <Quote className={"mt-0.5 h-4 w-4 shrink-0 " + (passed ? "text-emerald-600" : "text-amber-600")} />
+                <div className="flex-1">
+                  <p className={"text-xs font-medium " + (passed ? "text-emerald-700 dark:text-emerald-300" : "text-amber-700 dark:text-amber-300")}>
+                    评审员结论
                   </p>
-                  <p className="text-xs text-muted-foreground">建议：{review.suggestions}</p>
+                  <p className="mt-1 text-sm leading-relaxed">{review.verdict}</p>
                 </div>
               </div>
             </CardContent>
@@ -275,6 +285,9 @@ export function ReportView({ report }: { report: Report }) {
           <TabsList>
             <TabsTrigger value="summary">
               <FileText className="mr-1 h-3 w-3" /> 摘要
+            </TabsTrigger>
+            <TabsTrigger value="full">
+              <BookOpen className="mr-1 h-3 w-3" /> 完整报告
             </TabsTrigger>
             <TabsTrigger value="diagram">
               <GitBranch className="mr-1 h-3 w-3" /> 流程
@@ -302,6 +315,30 @@ export function ReportView({ report }: { report: Report }) {
               <CardContent>
                 {sections.executive_summary ? (
                   <Suspense fallback={<p className="p-4 text-xs text-muted-foreground">加载报告…</p>}><MarkdownRender content={sections.executive_summary} /></Suspense>
+                ) : (
+                  <p className="py-8 text-center text-sm text-muted-foreground">暂无报告内容。</p>
+                )}
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="full" className="mt-4">
+            <Card id="card-full">
+              <CardHeader className="flex-row items-center justify-between space-y-0 pb-3">
+                <CardTitle className="text-base">完整研究报告</CardTitle>
+                {fullMarkdown && (
+                  <DownloadButton
+                    content={fullMarkdown}
+                    filename={`${report.research.title.replace(/\s+/g, "-").toLowerCase()}.md`}
+                    label="下载完整 .md"
+                  />
+                )}
+              </CardHeader>
+              <CardContent>
+                {fullMarkdown ? (
+                  <Suspense fallback={<p className="p-4 text-xs text-muted-foreground">加载报告…</p>}>
+                    <MarkdownRender content={fullMarkdown} />
+                  </Suspense>
                 ) : (
                   <p className="py-8 text-center text-sm text-muted-foreground">暂无报告内容。</p>
                 )}
@@ -366,6 +403,7 @@ export function ReportView({ report }: { report: Report }) {
               <CardContent className="space-y-6">
                 {review ? (
                   <>
+                    {/* Scores + Radar */}
                     <div className="grid gap-6 md:grid-cols-[1fr_240px]">
                       <div className="space-y-2">
                         <p className="text-xs font-medium text-muted-foreground">各维度评分</p>
@@ -378,26 +416,125 @@ export function ReportView({ report }: { report: Report }) {
                         <ReviewRadar dimensions={review.dimensions} threshold={review.threshold} />
                       </div>
                     </div>
+
                     <Separator />
-                    <div className="grid gap-3 md:grid-cols-3">
-                      <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 p-3">
-                        <p className="text-xs font-medium text-emerald-700 dark:text-emerald-300">
-                          <CheckCircle2 className="mr-1 inline h-3 w-3" /> 优势
-                        </p>
-                        <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">{review.strengths}</p>
-                      </div>
-                      <div className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3">
-                        <p className="text-xs font-medium text-amber-700 dark:text-amber-300">
-                          <AlertCircle className="mr-1 inline h-3 w-3" /> 不足
-                        </p>
-                        <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">{review.weaknesses}</p>
-                      </div>
-                      <div className="rounded-md border bg-muted/50 p-3">
-                        <p className="text-xs font-medium">
-                          <Sparkles className="mr-1 inline h-3 w-3" /> 建议
-                        </p>
-                        <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">{review.suggestions}</p>
-                      </div>
+
+                    {/* Structured feedback */}
+                    <div className="space-y-4">
+                      {/* Strengths */}
+                      {(() => {
+                        const strs = getStrengths(review);
+                        if (strs.length === 0) return null;
+                        return (
+                          <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 p-4">
+                            <p className="mb-2 text-xs font-medium text-emerald-700 dark:text-emerald-300 flex items-center gap-1.5">
+                              <CheckCircle2 className="h-3.5 w-3.5" /> 优势 ({strs.length})
+                            </p>
+                            <ul className="space-y-1.5 text-xs leading-relaxed text-foreground/90">
+                              {strs.map((s, i) => (
+                                <li key={i} className="flex gap-2">
+                                  <span className="mt-1.5 h-1 w-1 shrink-0 rounded-full bg-emerald-500" />
+                                  <span>{s}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        );
+                      })()}
+
+                      {/* Weaknesses */}
+                      {(() => {
+                        const wks = getWeaknesses(review);
+                        if (wks.length === 0) return null;
+                        return (
+                          <div className="rounded-md border border-amber-500/30 bg-amber-500/5 p-4">
+                            <p className="mb-2 text-xs font-medium text-amber-700 dark:text-amber-300 flex items-center gap-1.5">
+                              <AlertTriangle className="h-3.5 w-3.5" /> 不足 ({wks.length})
+                            </p>
+                            <ul className="space-y-1.5 text-xs leading-relaxed text-foreground/90">
+                              {wks.map((s, i) => (
+                                <li key={i} className="flex gap-2">
+                                  <span className="mt-1.5 h-1 w-1 shrink-0 rounded-full bg-amber-500" />
+                                  <span>{s}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        );
+                      })()}
+
+                      {/* Improvements (actionable) */}
+                      {(() => {
+                        const imps = review.improvements || [];
+                        if (imps.length === 0) return null;
+                        return (
+                          <div className="rounded-md border border-blue-500/30 bg-blue-500/5 p-4">
+                            <p className="mb-2 text-xs font-medium text-blue-700 dark:text-blue-300 flex items-center gap-1.5">
+                              <ListChecks className="h-3.5 w-3.5" /> 改进建议 ({imps.length})
+                            </p>
+                            <ul className="space-y-1.5 text-xs leading-relaxed text-foreground/90">
+                              {imps.map((s, i) => (
+                                <li key={i} className="flex gap-2">
+                                  <span className="mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-blue-500/15 font-mono text-[10px] text-blue-700 dark:text-blue-300">{i+1}</span>
+                                  <span>{s}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        );
+                      })()}
+
+                      {/* Critical Questions */}
+                      {(() => {
+                        const qs = review.critical_questions || [];
+                        if (qs.length === 0) return null;
+                        return (
+                          <div className="rounded-md border border-purple-500/30 bg-purple-500/5 p-4">
+                            <p className="mb-2 text-xs font-medium text-purple-700 dark:text-purple-300 flex items-center gap-1.5">
+                              <HelpCircle className="h-3.5 w-3.5" /> 关键问题（需先回答）({qs.length})
+                            </p>
+                            <ul className="space-y-1.5 text-xs leading-relaxed text-foreground/90">
+                              {qs.map((s, i) => (
+                                <li key={i} className="flex gap-2">
+                                  <span className="mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-purple-500/15 font-mono text-[10px] text-purple-700 dark:text-purple-300">Q{i+1}</span>
+                                  <span>{s}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        );
+                      })()}
+
+                      {/* Next Steps */}
+                      {(() => {
+                        const steps = review.next_steps || [];
+                        if (steps.length === 0) return null;
+                        return (
+                          <div className="rounded-md border bg-muted/30 p-4">
+                            <p className="mb-2 text-xs font-medium flex items-center gap-1.5">
+                              <MessageSquareWarning className="h-3.5 w-3.5" /> 后续行动 ({steps.length})
+                            </p>
+                            <ul className="space-y-1.5 text-xs leading-relaxed text-foreground/90">
+                              {steps.map((s, i) => (
+                                <li key={i} className="flex gap-2">
+                                  <span className="mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-md bg-foreground/10 font-mono text-[10px]">→</span>
+                                  <span>{s}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        );
+                      })()}
+
+                      {/* Legacy single-string suggestions as fallback */}
+                      {!review.improvements?.length && review.suggestions && (
+                        <div className="rounded-md border bg-muted/50 p-3">
+                          <p className="text-xs font-medium flex items-center gap-1.5">
+                            <Sparkles className="h-3.5 w-3.5" /> 建议
+                          </p>
+                          <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">{review.suggestions}</p>
+                        </div>
+                      )}
                     </div>
                   </>
                 ) : (
@@ -409,9 +546,8 @@ export function ReportView({ report }: { report: Report }) {
         </Tabs>
       </div>
 
-      {/* Sticky TOC sidebar (desktop only) */}
       <div className="hidden lg:block">
-        <TableOfContents sections={sections} onNavigate={setTab} />
+        <TableOfContents sections={sections} fullReport={fullMarkdown} onNavigate={setTab} />
       </div>
     </div>
   );

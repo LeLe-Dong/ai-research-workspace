@@ -119,9 +119,17 @@ class Review(Base):
     research_id: Mapped[str] = mapped_column(String(12), ForeignKey("researches.id"), unique=True)
     overall_score: Mapped[float] = mapped_column(Float, default=0.0)
     dimensions: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Legacy single-string fields (kept for backwards compat with old reviews)
     strengths: Mapped[str] = mapped_column(Text, default="")
     weaknesses: Mapped[str] = mapped_column(Text, default="")
     suggestions: Mapped[str] = mapped_column(Text, default="")
+    # New structured fields (Phase 25: upgraded reviewer)
+    verdict: Mapped[str] = mapped_column(Text, default="")  # one-sentence conclusion
+    strengths_list: Mapped[str] = mapped_column(Text, default="")  # JSON-encoded list of strings
+    weaknesses_list: Mapped[str] = mapped_column(Text, default="")  # JSON-encoded list of strings
+    improvements: Mapped[str] = mapped_column(Text, default="")  # JSON-encoded list of strings
+    critical_questions: Mapped[str] = mapped_column(Text, default="")  # JSON-encoded list of strings
+    next_steps: Mapped[str] = mapped_column(Text, default="")  # JSON-encoded list of strings
     threshold: Mapped[float] = mapped_column(Float, default=7.0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 

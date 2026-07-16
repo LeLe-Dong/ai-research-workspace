@@ -132,6 +132,51 @@ async def run_research_job(research_id: str, timeout_sec: int = 900) -> None:
                                 content=evt.artifact["content"],
                                 version=1,
                             ))
+                            # If this is a review artifact, persist a Review row from its metadata
+                            if evt.artifact["kind"] == "review" and evt.artifact.get("metadata"):
+                                meta = evt.artifact["metadata"]
+                                dims = meta.get("dimensions") or {}
+                                import json as _json
+                                # Backwards compat: convert string strengths/weaknesses to list
+                                strs = meta.get("strengths", [])
+                                if isinstance(strs, str):
+                                    strs = [s.strip() for s in strs.split("；") if s.strip()] or [strs]
+                                wks = meta.get("weaknesses", [])
+                                if isinstance(wks, str):
+                                    wks = [s.strip() for s in wks.split("；") if s.strip()] or [wks]
+                                sugg = meta.get("suggestions", "")
+                                if isinstance(sugg, str):
+                                    sugg = [sugg] if sugg else []
+                                imps = meta.get("improvements", sugg)
+                                # Upsert Review row
+                                existing_rev = (await session.execute(
+                                    select(Review).where(Review.research_id == research_id)
+                                )).scalar_one_or_none()
+                                if existing_rev is None:
+                                    session.add(Review(
+                                        research_id=research_id,
+                                        overall_score=float(meta.get("overall_score", 0)),
+                                        dimensions=dims,
+                                        strengths=_json.dumps(strs, ensure_ascii=False),
+                                        weaknesses=_json.dumps(wks, ensure_ascii=False),
+                                        suggestions=_json.dumps(sugg, ensure_ascii=False) if sugg else "",
+                                        verdict=str(meta.get("verdict", "")),
+                                        strengths_list=_json.dumps(strs, ensure_ascii=False),
+                                        weaknesses_list=_json.dumps(wks, ensure_ascii=False),
+                                        improvements=_json.dumps(imps, ensure_ascii=False),
+                                        critical_questions=_json.dumps(meta.get("critical_questions", []), ensure_ascii=False),
+                                        next_steps=_json.dumps(meta.get("next_steps", []), ensure_ascii=False),
+                                        threshold=7.0,
+                                    ))
+                                else:
+                                    existing_rev.overall_score = float(meta.get("overall_score", 0))
+                                    existing_rev.dimensions = dims
+                                    existing_rev.verdict = str(meta.get("verdict", ""))
+                                    existing_rev.strengths_list = _json.dumps(strs, ensure_ascii=False)
+                                    existing_rev.weaknesses_list = _json.dumps(wks, ensure_ascii=False)
+                                    existing_rev.improvements = _json.dumps(imps, ensure_ascii=False)
+                                    existing_rev.critical_questions = _json.dumps(meta.get("critical_questions", []), ensure_ascii=False)
+                                    existing_rev.next_steps = _json.dumps(meta.get("next_steps", []), ensure_ascii=False)
 
                         if evt.phase == "review" and evt.level == "success":
                             for t in tasks:
@@ -145,21 +190,8 @@ async def run_research_job(research_id: str, timeout_sec: int = 900) -> None:
                             from app.services.history import record_version
                             await record_version(session, research, commit_message="自动完成", created_by="system")
 
-                            from app.agents.mock import REVIEW_DIMENSIONS
-                            overall = sum(REVIEW_DIMENSIONS.values()) / len(REVIEW_DIMENSIONS)
-                            existing = (await session.execute(
-                                select(Review).where(Review.research_id == research_id)
-                            )).scalar_one_or_none()
-                            if existing is None:
-                                session.add(Review(
-                                    research_id=research_id,
-                                    overall_score=overall,
-                                    dimensions=REVIEW_DIMENSIONS,
-                                    strengths="清晰的权衡分析；具体的实施阶段。",
-                                    weaknesses="对组织采用风险讨论有限。",
-                                    suggestions="添加利益相关方映射和 30-60-90 推广计划。",
-                                    threshold=7.0,
-                                ))
+                            # Review row is now persisted from the LLM review artifact metadata
+                            # (see artifact handler above). No more mock fallback.
 
                         await session.commit()
 

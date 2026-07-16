@@ -86,15 +86,25 @@ export function MarkdownRender({ content }: { content: string }) {
                 {children}
               </h1>
             ),
-            // Custom h2 with section number badge
-            h2: ({ children }) => (
-              <h2 className="flex items-center gap-2">
-                <span className="inline-flex h-5 w-5 items-center justify-center rounded bg-muted text-[10px] font-bold text-muted-foreground">
-                  {typeof children === "string" ? children.toString().slice(0, 1) : "•"}
-                </span>
-                {children}
-              </h2>
-            ),
+            // Custom h2: extract "N." prefix → badge N, show rest
+            h2: ({ children }) => {
+              const childText = typeof children === "string" ? children : String(children || "");
+              const numMatch = childText.match(/^(\d+)[.、]\s*/);
+              let num = "•";
+              let rest = childText;
+              if (numMatch) {
+                num = numMatch[1];
+                rest = childText.slice(numMatch[0].length);
+              }
+              return (
+                <h2 className="flex items-baseline gap-2.5">
+                  <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded bg-muted text-[10px] font-bold text-muted-foreground">
+                    {num}
+                  </span>
+                  <span>{rest}</span>
+                </h2>
+              );
+            },
             // Callout blockquote - if it starts with [!NOTE] etc
             blockquote: ({ children }) => {
               const text = String(children);

@@ -41,14 +41,41 @@ async def report(research_id: str, session: AsyncSession = Depends(get_session_d
             "research_flow_diagram": by_kind.get("mermaid").content if by_kind.get("mermaid") else None,
             "comparison_table": by_kind.get("table").content if by_kind.get("table") else None,
         },
-        "review": {
-            "overall_score": review.overall_score if review else None,
-            "dimensions": review.dimensions if review else {},
-            "strengths": review.strengths if review else "",
-            "weaknesses": review.weaknesses if review else "",
-            "suggestions": review.suggestions if review else "",
-            "threshold": review.threshold if review else 7.0,
-        } if review else None,
+        "full_report": by_kind.get("markdown").content if by_kind.get("markdown") else None,
+        "review": _build_review_payload(review) if review else None,
+    }
+
+
+def _parse_json_list(s: str | None) -> list:
+    """Parse a JSON-encoded list field. Returns [] on error or empty input."""
+    if not s:
+        return []
+    import json as _json
+    try:
+        v = _json.loads(s)
+        return v if isinstance(v, list) else [v]
+    except Exception:
+        # Legacy: split on common delimiters
+        if isinstance(s, str) and s:
+            parts = [p.strip() for p in s.replace("\n\n", "\n").split("\n") if p.strip()]
+            return parts if parts else [s]
+        return []
+
+
+def _build_review_payload(review) -> dict:
+    """Build the review payload, preferring structured lists over legacy strings."""
+    return {
+        "overall_score": review.overall_score,
+        "dimensions": review.dimensions or {},
+        "verdict": review.verdict or "",
+        # Prefer new *_list fields, fall back to legacy strings
+        "strengths": _parse_json_list(review.strengths_list) or _parse_json_list(review.strengths),
+        "weaknesses": _parse_json_list(review.weaknesses_list) or _parse_json_list(review.weaknesses),
+        "improvements": _parse_json_list(review.improvements),
+        "critical_questions": _parse_json_list(review.critical_questions),
+        "next_steps": _parse_json_list(review.next_steps),
+        "suggestions": review.suggestions or "",
+        "threshold": review.threshold,
     }
 
 

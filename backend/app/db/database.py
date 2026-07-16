@@ -63,6 +63,13 @@ async def init_db() -> None:
                 "ALTER TABLE researches ADD COLUMN error_message TEXT"
             ))
 
+        # Phase 25: add structured review columns (verdict, improvements, etc.)
+        review_cols = await conn.execute(text("PRAGMA table_info(reviews)"))
+        review_col_names = {c[1] for c in review_cols.all()}
+        for col in ['verdict', 'strengths_list', 'weaknesses_list', 'improvements', 'critical_questions', 'next_steps']:
+            if col not in review_col_names:
+                await conn.execute(text(f"ALTER TABLE reviews ADD COLUMN {col} TEXT DEFAULT ''"))
+
 
 @asynccontextmanager
 async def get_session() -> AsyncIterator[AsyncSession]:

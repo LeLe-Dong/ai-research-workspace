@@ -349,7 +349,13 @@ class StepfunAgentClient(AgentClient):
             try:
                 review_payload = await self.llm.chat_json(
                     REVIEWER_SYSTEM,
-                    REVIEWER_USER_TEMPLATE.format(report=report_md[:5000]),
+                    REVIEWER_USER_TEMPLATE.format(
+                        title=req.title,
+                        goal=req.goal,
+                        constraints=req.constraints or "(none)",
+                        depth=req.depth,
+                        report=report_md[:6000],  # bumped from 5000 for richer review
+                    ),
                     max_tokens=8000,  # bumped to fit thinking + JSON
                     temperature=0.2,  # lower for more deterministic output
                 )

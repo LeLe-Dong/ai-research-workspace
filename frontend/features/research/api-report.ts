@@ -9,9 +9,17 @@ export interface ReportSection {
 export interface ReportReview {
   overall_score: number | null;
   dimensions: Record<string, number>;
-  strengths: string;
-  weaknesses: string;
-  suggestions: string;
+  // Legacy string fields (kept for backwards compat with old reviews)
+  strengths: string | string[];
+  weaknesses: string | string[];
+  suggestions: string | string[];
+  // New structured fields (Phase 25)
+  verdict?: string;
+  strengths_list?: string[];
+  weaknesses_list?: string[];
+  improvements?: string[];
+  critical_questions?: string[];
+  next_steps?: string[];
   threshold: number;
 }
 
@@ -29,6 +37,7 @@ export interface Report {
     updated_at: string;
   };
   sections: ReportSection;
+  full_report?: string | null;
   review: ReportReview | null;
 }
 
