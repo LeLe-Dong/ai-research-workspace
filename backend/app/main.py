@@ -19,6 +19,12 @@ async def lifespan(app: FastAPI):
     if inserted:
         import logging
         logging.getLogger(__name__).info(f"Seeded {inserted} sample researches")
+    # Auto-recover stuck research from previous uvicorn runs
+    from app.services.executor import recover_stuck_research
+    recovered = await recover_stuck_research(idle_seconds=300)
+    if recovered:
+        import logging
+        logging.getLogger(__name__).info(f"Recovered {recovered} stuck research(es) on startup")
     yield
 
 

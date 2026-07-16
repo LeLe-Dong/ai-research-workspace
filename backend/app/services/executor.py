@@ -228,3 +228,55 @@ async def run_research_job(research_id: str, timeout_sec: int = 900) -> None:
         except Exception:
             pass  # best effort
         raise
+
+
+async def recover_stuck_research(idle_seconds: int = 300) -> int:
+    """Mark research stuck in 'running' state for too long as 'failed'.
+
+    Used on uvicorn startup to clean up after previous runs that were killed
+    mid-execution (e.g. uvicorn restart, OOM kill, deploy).
+
+    A research is "stuck" if status='running' AND last timeline event is older
+    than `idle_seconds`.
+
+    Returns number of research marked as failed.
+    """
+    from datetime import datetime, timedelta
+    from sqlalchemy import delete
+    from app.db.models import TimelineEvent
+    import logging
+    logger = logging.getLogger(__name__)
+
+    recovered = 0
+    try:
+        async with get_session() as session:
+            result = await session.execute(
+                select(Research).where(Research.status == "running")
+            )
+            running = result.scalars().all()
+            cutoff = datetime.utcnow() - timedelta(seconds=idle_seconds)
+
+            for r in running:
+                # Check last timeline event
+                last_evt = (await session.execute(
+                    select(TimelineEvent)
+                    .where(TimelineEvent.research_id == r.id)
+                    .order_by(TimelineEvent.ts.desc())
+                    .limit(1)
+                )).scalar_one_or_none()
+
+                if last_evt is None or last_evt.ts < cutoff:
+                    idle = (datetime.utcnow() - (last_evt.ts if last_evt else r.created_at))
+                    r.status = "failed"
+                    r.error_message = (
+                        f"自动恢复: 研究卡住超过 {idle_seconds}s"
+                        f"（实际 {int(idle.total_seconds())}s），已标记为 failed，请重新运行"
+                    )
+                    r.updated_at = datetime.utcnow()
+                    recovered += 1
+            if recovered:
+                await session.commit()
+    except Exception as e:
+        logger.warning(f"recover_stuck_research failed: {e}")
+
+    return recovered

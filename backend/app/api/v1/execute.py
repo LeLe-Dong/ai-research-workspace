@@ -26,12 +26,21 @@ def _get_lock(research_id: str) -> asyncio.Lock:
 
 
 @router.post("/{research_id}/start", status_code=202)
-async def start(research_id: str, session: AsyncSession = Depends(get_session_dep)):
+async def start(
+    research_id: str,
+    force: bool = False,
+    session: AsyncSession = Depends(get_session_dep),
+):
     r = (await session.execute(select(Research).where(Research.id == research_id))).scalar_one_or_none()
     if r is None:
         raise HTTPException(404, "Research not found")
-    if r.status == "running":
+    if r.status == "running" and not force:
         return {"status": "already_running", "research_id": research_id}
+    if r.status == "running" and force:
+        # Force-restart: likely a ghost (uvicorn restarted, asyncio task died but DB stuck)
+        r.status = "pending"
+        r.error_message = "强制重启 (前次执行失联)"
+        await session.commit()
     if r.status == "completed":
         # Allow re-run by resetting status; user can press "Run again"
         r.status = "pending"
