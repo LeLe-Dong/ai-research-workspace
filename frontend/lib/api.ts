@@ -1,8 +1,19 @@
-// API base: env override, or relative paths (works behind reverse proxy).
-// When behind nginx, leave NEXT_PUBLIC_API_BASE unset and /api/* will hit the same origin.
-// For local dev without proxy, set NEXT_PUBLIC_API_BASE=http://127.0.0.1:8003
-// Cache-bust: force-new-hash-2026-07-16-1500
-export const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "") as string;
+// API base resolution:
+//   1. Build-time env var: NEXT_PUBLIC_API_BASE (e.g. "http://127.0.0.1:8003")
+//   2. Runtime: default to window.location.origin so the page hits the SAME host it's on
+//      (works behind nginx, or when next.js proxies /api/*)
+//
+// This means: when accessed from http://10.6.69.20/ → /api/* goes to
+// http://10.6.69.20/api/*. No more "Failed to fetch" because 127.0.0.1 doesn't exist
+// on the user's machine.
+// Cache-bust: force-new-hash-2026-07-17-1030
+function resolveApiBase(): string {
+  const envBase = process.env.NEXT_PUBLIC_API_BASE;
+  if (envBase && envBase.length > 0) return envBase;
+  if (typeof window !== "undefined") return window.location.origin;
+  return ""; // SSR fallback (won't be hit since pages use "use client")
+}
+export const API_BASE = resolveApiBase();
 
 export class ApiError extends Error {
   constructor(public status: number, public body: string, message: string) {
