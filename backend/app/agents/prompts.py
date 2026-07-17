@@ -128,13 +128,13 @@ REPORT_SYSTEM = """You are a senior research analyst writing a comprehensive tec
 [详细描述当前实践现状：谁在用什么工具/方法，主流方案有哪些，成熟度如何]
 
 ## 4. 核心痛点
-[列出 5-8 个具体痛点（bullet 列表）。每个痛点要命名特定的失败模式，并配一行例子]
+[Markdown 表格呈现 5-8 个具体痛点。列：痛点编号 | 痛点描述 | 失败模式 | 典型场景/示例 1 句话。表格要能让决策者一眼看出每个痛点的实际后果]
 
 ## 5. 需求分析
-[列出 5-8 条从研究目标推导出的明确需求（bullet 列表）。区分必须满足 vs 加分项]
+[Markdown 表格呈现 5-8 条需求。列：编号 | 需求描述 | 优先级（必须满足 / 加分项） | 验收标准 1 句话。必须满足与加分项在同一张表格内，用优先级列区分]
 
 ## 6. 候选方案
-[对 2-4 个候选方案：名称、一句话标签、2-3 句方法描述、关键优势、关键劣势]
+[Markdown 表格呈现 2-4 个候选方案。列：候选名称 | 一句话标签 | 核心方法描述（2-3 句话） | 关键优势（1 行） | 关键劣势（1 行） | 适用场景。每个候选一行]
 
 ## 7. 对比矩阵
 [Markdown 表格，行=6-8 个评估维度（技术可行性、可维护性、可扩展性、成本、风险、创新性、上线时间、生态成熟度等），列=各候选方案。单元格：具体 1-10 分或定性的 ✓/✗/⚠ 评判]
@@ -143,16 +143,16 @@ REPORT_SYSTEM = """You are a senior research analyst writing a comprehensive tec
 [用 2-3 段解释：推荐方案为何在关键维度上获胜、付出了哪些权衡代价、在什么情况下备选方案可能更好]
 
 ## 9. 推荐方案
-[给出推荐方案名称 + 1 段理由 + 4-6 个关键决策点（用户推进前必须明确选择的项）]
+[1 段说明推荐方案名称 + 选择理由（不要 bullet）。然后用 Markdown 表格列 4-6 个关键决策点：列：决策点 | 决策内容 | 影响范围 | 推进条件。每行一个决策，用户必须在推进前明确回答]
 
 ## 10. 实施计划
-[3-5 个编号阶段，每个包含：周次范围、关键产出、对前一阶段的依赖、退出标准]
+[Markdown 表格呈现 3-5 个实施阶段。列：阶段编号 | 阶段名称 | 周次范围 | 关键产出 | 依赖前置阶段 | 退出标准。每行一个阶段，最后一列必须是可验收的硬指标]
 
 ## 11. 风险分析
 [Markdown 表格：风险 | 可能性（低/中/高）| 影响（低/中/高）| 缓解策略。然后 1 段说明残余风险]
 
 ## 12. 评估分数与下一步行动
-[引用评审部分给出的分数。然后 3-5 条具体下一步行动（列 bullet，标责任人与依赖）]
+[1-2 段引用评审给出的综合分数与维度得分。然后用 Markdown 表格列 3-5 条具体下一步行动：列：编号 | 行动项 | 责任方 | 时间节点 | 依赖。表格要让用户能直接拆任务]
 
 Style rules:
 - Be SPECIFIC: cite numbers, version numbers, concrete examples
@@ -163,6 +163,7 @@ Style rules:
     - standard → 3000-4000 words (balanced, 8-10 sections — drop minor ones)
     - deep → 4500-5500 words (thorough, all 12 sections)
 - Replace ALL placeholders with real content
+- **用表格表达数据**：所有对比、痛点、需求、候选方案、决策点、实施阶段、风险、行动项均使用 Markdown 表格。纯叙述段落仅用于：执行摘要、背景、现状分析、权衡分析。表格列标题要清晰（不要用"项目1"这种含糊词）
 
 Image embedding rule (CRITICAL):
 If the user prompt contains a "Discovered Images" section with markdown image syntax (e.g. ![Title](url)),
