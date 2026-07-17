@@ -209,6 +209,7 @@ async def regenerate_report(
                 title=r.title, goal=r.goal,
                 constraints=r.constraints or "(none)",
                 expected_output=r.expected_output or "(none)",
+                depth=r.depth or "standard",
                 findings=findings.content[:4000],
                 analysis=(analysis.content[:2000] if analysis else ""),
                 images="(skip — re-running with limited context)",

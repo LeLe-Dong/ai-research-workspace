@@ -34,6 +34,14 @@ export function MarkdownRender({ content }: { content: string }) {
       <article className="report-prose">
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
+          urlTransform={(value) => {
+            // react-markdown default blocks data: URLs — allow them for inline SVG placeholders
+            if (value && value.startsWith("data:")) return value;
+            if (value && /^(https?|ircs?|mailto|xmpp):/i.test(value)) return value;
+            if (value && !value.includes(":")) return value; // relative URL
+            // Block javascript:, vbscript:, etc.
+            return value || "";
+          }}
           components={{
             // H1: report title — only used as a top-level
             h1: ({ children, id }) => (
@@ -89,7 +97,22 @@ export function MarkdownRender({ content }: { content: string }) {
             img: ({ src, alt }) => (
               <span className="report-img-wrap">
                 {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src={src} alt={alt || ""} className="report-img" loading="lazy" />
+                <img
+                  src={src}
+                  alt={alt || ""}
+                  className="report-img"
+                  loading="lazy"
+                  referrerPolicy="no-referrer"
+                  crossOrigin="anonymous"
+                  onError={(e) => {
+                    const target = e.currentTarget;
+                    if (!target.dataset.fallback) {
+                      target.dataset.fallback = "1";
+                      target.classList.add("report-img-broken");
+                      target.alt = (target.alt || "") + " (图片加载失败)";
+                    }
+                  }}
+                />
                 {alt && <span className="report-img-caption">{alt}</span>}
               </span>
             ),

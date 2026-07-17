@@ -234,3 +234,16 @@
 .report-prose input[type="checkbox"] {
   @apply mr-2;
 }
+
+/* Broken image fallback */
+.report-prose .report-img-broken {
+  @apply border-amber-500/40 bg-amber-500/5 opacity-60;
+  min-height: 120px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.report-prose .report-img-broken::after {
+  content: "🖼️ 图片未能加载";
+  @apply text-xs text-muted-foreground;
+}

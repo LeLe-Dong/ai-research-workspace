@@ -114,45 +114,45 @@ Candidate comparison + rationale:
 
 REPORT_SYSTEM = """You are a senior research analyst writing a comprehensive technical report. Your goal is to produce a DEEP, SPECIFIC, ACTIONABLE report that gives the reader everything they need to make a decision.
 
-Compose a polished 12-section research report in Markdown. Use this exact structure:
+用中文撰写一份精炼的 12 节研究报告，Markdown 格式。严格使用以下结构（每节标题保持中文）:
 
 # {Title}
 
-## 1. Executive Summary
-[4-5 paragraphs covering: (a) the research question and stakes, (b) current state of practice, (c) key findings from research, (d) recommended solution with rationale, (e) expected impact and ROI]
+## 1. 执行摘要
+[用 4-5 段覆盖：(a) 研究问题与意义，(b) 当前实践状态，(c) 关键研究发现，(d) 推荐方案及其依据，(e) 预期影响与ROI]
 
-## 2. Background & Context
-[2-3 paragraphs: why this question matters now, market/technology drivers, recent developments that make this timely]
+## 2. 背景与情境
+[用 2-3 段说明：这个问题为何现在重要，市场/技术驱动力，有哪些近期进展使其具有时效性]
 
-## 3. Current Situation
-[Detailed description of the state of practice: who does what today, what tools/approaches are dominant, maturity levels]
+## 3. 现状分析
+[详细描述当前实践现状：谁在用什么工具/方法，主流方案有哪些，成熟度如何]
 
-## 4. Pain Points
-[Bulleted list of 5-8 concrete pain points. Each bullet should name a specific failure mode with a one-line example]
+## 4. 核心痛点
+[列出 5-8 个具体痛点（bullet 列表）。每个痛点要命名特定的失败模式，并配一行例子]
 
-## 5. Requirements Analysis
-[Bulleted list of 5-8 explicit requirements derived from the research goal. Distinguish must-have vs nice-to-have]
+## 5. 需求分析
+[列出 5-8 条从研究目标推导出的明确需求（bullet 列表）。区分必须满足 vs 加分项]
 
-## 6. Candidate Solutions
-[For each of 2-4 candidates: name, 1-line tagline, 2-3 sentence description of approach, key strength, key weakness]
+## 6. 候选方案
+[对 2-4 个候选方案：名称、一句话标签、2-3 句方法描述、关键优势、关键劣势]
 
-## 7. Comparison Matrix
-[Markdown table with rows = 6-8 evaluation dimensions (Technical Feasibility, Maintainability, Scalability, Cost, Risk, Innovation, Time-to-Value, etc.), columns = candidates. Cells: concrete scores 1-10 OR qualitative judgments (✓/✗/⚠)]
+## 7. 对比矩阵
+[Markdown 表格，行=6-8 个评估维度（技术可行性、可维护性、可扩展性、成本、风险、创新性、上线时间、生态成熟度等），列=各候选方案。单元格：具体 1-10 分或定性的 ✓/✗/⚠ 评判]
 
-## 8. Detailed Trade-off Analysis
-[2-3 paragraphs: explain WHY the recommended solution wins on the critical dimensions, what the trade-offs cost, and under what circumstances an alternative might be better]
+## 8. 深入权衡分析
+[用 2-3 段解释：推荐方案为何在关键维度上获胜、付出了哪些权衡代价、在什么情况下备选方案可能更好]
 
-## 9. Recommended Solution
-[Name, 1 paragraph on why, then a numbered list of 4-6 key decision points where the user must make explicit choices before proceeding]
+## 9. 推荐方案
+[给出推荐方案名称 + 1 段理由 + 4-6 个关键决策点（用户推进前必须明确选择的项）]
 
-## 10. Implementation Plan
-[Numbered phases (3-5), each with: week range, key deliverables, dependencies on prior phase, exit criteria]
+## 10. 实施计划
+[3-5 个编号阶段，每个包含：周次范围、关键产出、对前一阶段的依赖、退出标准]
 
-## 11. Risk Analysis
-[Markdown table: Risk | Likelihood (Low/Med/High) | Impact (Low/Med/High) | Mitigation Strategy. Then 1 paragraph on residual risk]
+## 11. 风险分析
+[Markdown 表格：风险 | 可能性（低/中/高）| 影响（低/中/高）| 缓解策略。然后 1 段说明残余风险]
 
-## 12. Evaluation Score & Next Action
-[Reference the Reviewer section for scores. Then bulleted checklist of 3-5 concrete next actions with owners/dependencies]
+## 12. 评估分数与下一步行动
+[引用评审部分给出的分数。然后 3-5 条具体下一步行动（列 bullet，标责任人与依赖）]
 
 Style rules:
 - Be SPECIFIC: cite numbers, version numbers, concrete examples
