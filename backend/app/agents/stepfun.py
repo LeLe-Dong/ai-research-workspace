@@ -226,6 +226,7 @@ class StepfunAgentClient(AgentClient):
                     RESEARCH_USER_TEMPLATE.format(
                         goal=req.goal,
                         constraints=req.constraints or "(none)",
+                        expected_output=req.expected_output or "(none)",
                         sub_questions="\n".join(f"- {q}" for q in sub_questions),
                         search_results=sources_md,
                     ),
@@ -289,6 +290,7 @@ class StepfunAgentClient(AgentClient):
                         title=req.title, goal=req.goal,
                         constraints=req.constraints or "(none)",
                         expected_output=req.expected_output or "(none)",
+                        depth=req.depth,
                         findings=findings[:4000],  # reduced from 5000 to leave room for output
                         analysis=analysis[:2000],  # reduced from 2500
                         images=image_md or "(none)",

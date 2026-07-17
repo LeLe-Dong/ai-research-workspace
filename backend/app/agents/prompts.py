@@ -27,7 +27,10 @@ Constraints: {constraints}
 
 Expected Output: {expected_output}
 
-Produce the JSON decomposition.
+Priority: {priority}        # low / medium / high
+Depth: {depth}              # quick / standard / deep
+
+Produce the JSON decomposition. Match sub-question count to the priority/depth above.
 """
 
 
@@ -61,6 +64,8 @@ RESEARCH_USER_TEMPLATE = """Research Goal: {goal}
 
 Constraints: {constraints}
 
+Expected Output (shape the synthesis accordingly): {expected_output}
+
 Sub-questions to answer:
 {sub_questions}
 
@@ -68,6 +73,7 @@ Search Results:
 {search_results}
 
 Now synthesize the findings in Markdown. Reference sources as [1], [2], etc.
+If Expected Output specifies concrete deliverables (e.g., "对比矩阵", "实施计划", "风险清单"), make sure each appears in your synthesis.
 """
 
 
@@ -152,7 +158,10 @@ Style rules:
 - Be SPECIFIC: cite numbers, version numbers, concrete examples
 - Be HONEST: if evidence is thin, say so; do not invent
 - Be ACTIONABLE: every section should give the reader something to decide or do
-- Length target: 4500-5500 words total (significantly more than typical reports)
+- Length target varies by depth:
+    - quick → 1500-2500 words (concise, 6-8 sections)
+    - standard → 3000-4000 words (balanced, 8-10 sections — drop minor ones)
+    - deep → 4500-5500 words (thorough, all 12 sections)
 - Replace ALL placeholders with real content
 
 Image embedding rule:
@@ -171,6 +180,8 @@ Constraints: {constraints}
 
 Expected Output: {expected_output}
 
+Depth: {depth}    # quick / standard / deep — controls section count and length
+
 Research Findings:
 {findings}
 
@@ -182,7 +193,7 @@ Comparison Analysis:
 
 IMPORTANT: The images above MUST appear inline in the report (e.g., inside section 6 "Candidate Solutions" or section 7 "Comparison Matrix"). Do not put them in a separate appendix section.
 
-CRITICAL: Include ALL 10 sections with FULL content. Do not summarize or skip sections.
+CRITICAL: Adapt section count and detail to the Depth above. For "quick" you may condense sections 3/4/9/10 to bullet lists. For "deep" include all 12 sections with full paragraphs.
 Each section should be 2-4 paragraphs. Embed the images above in the relevant sections.
 """
 
