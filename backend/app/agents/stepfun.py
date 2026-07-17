@@ -358,46 +358,50 @@ class StepfunAgentClient(AgentClient):
                     if not result["truncated"]:
                         break
             except LLMError as e:
-                # One retry with smaller prompt
+                # First try failed — retry once with smaller prompt and depth.
+                # This is the LEGACY fallback path; the new continue-on-truncate
+                # logic above handles partial failures better, but if the FIRST
+                # call itself errors out (e.g. stepfun 500), we still need a retry.
                 logger.warning("report phase first try failed (%s), retrying", e)
                 try:
-                    report_md = await self.llm.chat(
-                        REPORT_SYSTEM,
-                        REPORT_USER_TEMPLATE.format(
-                            title=req.title, goal=req.goal,
-                            constraints=req.constraints or "(none)",
-                            expected_output=req.expected_output or "(none)",
-                            findings=findings[:2500],
-                            analysis=analysis[:1500],
-                            images=image_md or "(none)",
-                        ),
-                        max_tokens=8000,
+                    retry_user_msg = REPORT_USER_TEMPLATE.format(
+                        title=req.title, goal=req.goal,
+                        constraints=req.constraints or "(none)",
+                        expected_output=req.expected_output or "(none)",
+                        depth=req.depth,
+                        findings=findings[:2500],
+                        analysis=analysis[:1500],
+                        images=image_md or "(none)",
                     )
-                    report_md = _strip_thinking(report_md, is_json=False)
+                    result = await self.llm.chat_with_metadata(
+                        REPORT_SYSTEM, retry_user_msg, max_tokens=16000,
+                    )
+                    report_md = _strip_thinking(result["content"], is_json=False)
+                    report_md = _rewrite_image_urls_to_proxy(report_md)
                 except LLMError:
                     raise
                 yield AgentEvent(phase="summarize", level="success",
-                                 title="报告撰写完成",
+                                 title="报告撰写完成 (重试)",
                                  detail=f"{len(report_md)} 字符")
             except LLMError as e:
                 logger.warning("report phase LLM failed: %s", e)
-                # Synthesize a usable report from prior phase outputs
+                # Synthesize a usable report from prior phase outputs (降级处理)
                 report_md = (
                     f"# {req.title}\n\n"
-                    f"## 1. Executive Summary\n\n"
-                    f"_Note: The final report synthesis phase encountered an LLM error ({str(e)[:80]}). "
-                    f"The findings and analysis below were generated directly by the agent without a final pass._\n\n"
-                    f"This research examined: **{req.goal}**\n\n"
-                    f"The full comparison matrix is available in the **Comparison** tab. "
-                    f"The detailed findings with source citations are in the **Comparison Table** artifact.\n\n"
-                    f"## 2. Research Findings\n\n{findings}\n\n"
-                    f"## 3. Comparative Analysis\n\n{analysis}\n\n"
-                    f"## 4. Reviewer Note\n\n"
-                    f"See the **Reviewer** tab for the quality assessment."
+                    f"## 1. 执行摘要\n\n"
+                    f"**注意**：综合报告阶段遇到 LLM 错误（{str(e)[:80]}）。"
+                    f"下方保留了前期 findings + analysis，可作为原始参考。\n\n"
+                    f"本次研究目标：**{req.goal}**\n\n"
+                    f"完整的对比矩阵可在 **对比** Tab 查看。"
+                    f"含引用源的研究发现见 **对比表格** 产物。\n\n"
+                    f"## 2. 研究发现\n\n{findings}\n\n"
+                    f"## 3. 对比分析\n\n{analysis}\n\n"
+                    f"## 4. 评审备注\n\n"
+                    f"请到 **评审** Tab 查看质量评估。"
                 )
                 yield AgentEvent(phase="summarize", level="warn",
                                  title="报告降级处理（合成阶段 LLM 错误）",
-                                 detail=f"Findings ({len(findings)} chars) + Analysis ({len(analysis)} chars) preserved as report")
+                                 detail=f"Findings ({len(findings)} 字符) + Analysis ({len(analysis)} 字符) 已保留")
 
             yield AgentEvent(phase="summarize", level="success",
                              title="最终报告完成",
