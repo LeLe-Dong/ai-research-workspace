@@ -47,6 +47,34 @@ def _safe_cache_key(url: str) -> str:
     return hashlib.sha256(url.encode()).hexdigest()[:32]
 
 
+@router.get("/svg/{svg_b64:path}.svg")
+async def proxy_svg(svg_b64: str) -> Response:
+    """Serve a SVG that was base64url-encoded in the path.
+
+    Used by the search backend to ship SVG placeholders to the LLM as opaque
+    URLs (so the model doesn't try to "fix" the SVG and break its quoting).
+    The LLM sees `/api/v1/image-proxy/svg/xxx.svg` and passes it through unchanged;
+    the browser decodes the base64 and renders the SVG.
+    """
+    import base64
+    # base64url uses - and _ instead of + and /
+    try:
+        # Pad to multiple of 4
+        padded = svg_b64 + "=" * ((4 - len(svg_b64) % 4) % 4)
+        # Translate base64url to standard base64
+        standard = padded.replace("-", "+").replace("_", "/")
+        svg_bytes = base64.b64decode(standard)
+    except Exception as e:
+        raise HTTPException(400, f"Invalid base64 SVG: {e}")
+    if len(svg_bytes) > 50_000:
+        raise HTTPException(413, "SVG too large")
+    return Response(
+        content=svg_bytes,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 @router.get("")
 async def proxy(url: str = Query(..., min_length=10, max_length=2000)) -> Response:
     """Server-side fetch an external image and stream it back."""

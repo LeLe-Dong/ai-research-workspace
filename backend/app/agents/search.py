@@ -236,15 +236,16 @@ class WebSearcher:
         svg = (
             f'<svg xmlns="http://www.w3.org/2000/svg" width="400" height="240" viewBox="0 0 400 240">'
             f'<rect width="400" height="240" fill="rgb({r},{g},{b})"/>'
-            f'<text x="200" y="135" font-family="Inter,system-ui,sans-serif" font-size="80" '
+            f'<text x=\"200\" y=\"135\" font-family=\"Inter,system-ui,sans-serif\" font-size=\"80\" '
             f'font-weight="700" fill="white" text-anchor="middle">{initials}</text>'
             f'</svg>'
         )
         import base64
-        b64 = base64.b64encode(svg.encode()).decode()
+        b64_std = base64.b64encode(svg.encode()).decode()
+        b64_url = b64_std.replace("+", "-").replace("/", "_").rstrip("=")
         return {
             "title": f"{query} (示意)",
-            "image_url": f"data:image/svg+xml;base64,{b64}",
+            "image_url": f"/api/v1/image-proxy/svg/{b64_url}.svg",
             "source_url": "",
             "width": 400,
             "height": 240,

@@ -102,8 +102,10 @@ export function MarkdownRender({ content }: { content: string }) {
                   alt={alt || ""}
                   className="report-img"
                   loading="lazy"
+                  // Only apply crossOrigin to real http(s) URLs — data: URIs don't
+                  // support CORS and would fail with crossOrigin="anonymous".
+                  crossOrigin={typeof src === "string" && src.startsWith("http") ? "anonymous" : undefined}
                   referrerPolicy="no-referrer"
-                  crossOrigin="anonymous"
                   onError={(e) => {
                     const target = e.currentTarget;
                     if (!target.dataset.fallback) {

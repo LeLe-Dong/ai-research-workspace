@@ -54,7 +54,9 @@ def _rewrite_image_urls_to_proxy(markdown_text: str, proxy_path: str = "/api/v1/
             return f"![{alt}]({proxy_path}?url={encoded})"
         return match.group(0)
 
-    return re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", repl, markdown_text)
+        # Pattern handles alt text containing square brackets: ![alt with [brackets]](url)
+    # Use a non-greedy match for the URL portion too
+    return re.sub(r"!\[(.+?)\]\((https?://[^\s)]+)\)", repl, markdown_text)
 
 
 
