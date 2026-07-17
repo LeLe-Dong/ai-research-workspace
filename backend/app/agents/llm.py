@@ -144,6 +144,65 @@ class StepfunClient:
         except httpx.HTTPError as e:
             raise LLMError(f"{type(e).__name__}: {e}") from e
 
+    async def chat_with_metadata(
+        self,
+        system: str,
+        user: str,
+        *,
+        temperature: float = 0.4,
+        max_tokens: int = 4000,
+        response_format_json: bool = False,
+    ) -> dict:
+        """Same as chat() but returns finish_reason + token usage for truncation detection.
+
+        Returns: { content, finish_reason, truncated, prompt_tokens, completion_tokens, total_tokens }
+        """
+        if not self.api_key:
+            raise LLMError("API key not set")
+        url = f"{self.base_url}/chat/completions"
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        body = {
+            "model": self.model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if response_format_json:
+            body["response_format"] = {"type": "json_object"}
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.post(url, json=body, headers=headers)
+                if resp.status_code != 200:
+                    raise LLMError(f"Stepfun {resp.status_code}: {resp.text[:300]}")
+                data = resp.json()
+                choices = data.get("choices") or []
+                if not choices:
+                    raise LLMError("No choices in response")
+                choice = choices[0]
+                msg = choice.get("message") or {}
+                content = msg.get("content") or ""
+                finish_reason = choice.get("finish_reason", "stop")
+                if not content.strip() and msg.get("reasoning_content"):
+                    content = msg["reasoning_content"]
+                if not content.strip():
+                    raise LLMError(f"Empty content from LLM (finish_reason={finish_reason})")
+                if finish_reason == "length":
+                    content = content + "\n\n[truncated: max_tokens reached]"
+                usage = data.get("usage") or {}
+                return {
+                    "content": content,
+                    "finish_reason": finish_reason,
+                    "truncated": finish_reason == "length",
+                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                    "completion_tokens": usage.get("completion_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                }
+        except httpx.TimeoutException:
+            raise LLMError(f"LLM timeout after {self.timeout}s")
+        except httpx.HTTPError as e:
+            raise LLMError(f"{type(e).__name__}: {e}") from e
+
+
     async def chat_json(self, system: str, user: str, **kwargs) -> dict:
         """Convenience: chat + parse JSON. Tries hard to extract JSON from prose-wrapped output.
 

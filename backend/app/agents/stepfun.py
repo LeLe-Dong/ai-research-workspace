@@ -1,4 +1,5 @@
 import json
+import re
 import logging
 """StepfunAgentClient: real LLM-driven research execution.
 
@@ -315,21 +316,44 @@ class StepfunAgentClient(AgentClient):
                              detail="让 LLM 撰写完整 10 节报告",
                              task_id="task-08", task_progress=0)
             try:
-                report_md = await self.llm.chat(
-                    REPORT_SYSTEM,
-                    REPORT_USER_TEMPLATE.format(
-                        title=req.title, goal=req.goal,
-                        constraints=req.constraints or "(none)",
-                        expected_output=req.expected_output or "(none)",
-                        depth=req.depth,
-                        findings=findings[:4000],  # reduced from 5000 to leave room for output
-                        analysis=analysis[:2000],  # reduced from 2500
-                        images=image_md or "(none)",
-                    ),
-                    max_tokens=16000,  # bumped from 8000 — 12-section report needs ~16k tokens
+                # Continue-on-truncate: if the LLM hits max_tokens, append another
+                # continuation rather than truncating the report.
+                # 3 attempts × 32k tokens each ≈ 96k tokens ceiling (well over the
+                # ~25k tokens needed for a complete 12-section deep report).
+                user_msg = REPORT_USER_TEMPLATE.format(
+                    title=req.title, goal=req.goal,
+                    constraints=req.constraints or "(none)",
+                    expected_output=req.expected_output or "(none)",
+                    depth=req.depth,
+                    findings=findings[:4000],
+                    analysis=analysis[:2000],
+                    images=image_md or "(none)",
                 )
-                report_md = _strip_thinking(report_md, is_json=False)  # remove "Got it, let's..." preamble
-                report_md = _rewrite_image_urls_to_proxy(report_md)  # route external images through proxy
+                for attempt in range(3):
+                    seed = report_md if report_md else ""
+                    prompt_this = user_msg
+                    if seed:
+                        prompt_this = user_msg + "\n\n--- 上文（请从这里继续，不要重复，不要重新输出前面的内容）---\n" + seed
+                    result = await self.llm.chat_with_metadata(
+                        REPORT_SYSTEM,
+                        prompt_this,
+                        max_tokens=32000,
+                    )
+                    chunk = _strip_thinking(result["content"], is_json=False)
+                    chunk = _rewrite_image_urls_to_proxy(chunk)
+                    if report_md and chunk.startswith("#"):
+                        # Strip leading heading if model re-output it
+                        chunk = re.sub(r"^#\s+[^\n]*\n", "", chunk, count=1)
+                    report_md = (report_md + "\n\n" + chunk).strip() if report_md else chunk
+                    yield AgentEvent(
+                        phase="summarize",
+                        level="info",
+                        title=f"报告第 {attempt + 1} 段: {result['completion_tokens']} tokens"
+                              + (" · 已截断，继续..." if result["truncated"] else " · 完成"),
+                        detail=f"累计 {len(report_md)} 字符",
+                    )
+                    if not result["truncated"]:
+                        break
             except LLMError as e:
                 # One retry with smaller prompt
                 logger.warning("report phase first try failed (%s), retrying", e)
