@@ -219,8 +219,9 @@ async def regenerate_report(
     except Exception as e:
         raise HTTPException(502, f"Regenerate failed: {e}")
 
+    from app.agents.stepfun import _rewrite_image_urls_to_proxy
     import json as _json
-    report_md = report_md.strip()
+    report_md = _rewrite_image_urls_to_proxy(report_md.strip())
 
     # Bump version on existing markdown artifact, replace content
     md_art = by_kind.get("markdown")

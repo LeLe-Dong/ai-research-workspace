@@ -28,6 +28,35 @@ from app.agents.prompts import (
 logger = logging.getLogger(__name__)
 
 
+def _rewrite_image_urls_to_proxy(markdown_text: str, proxy_path: str = "/api/v1/image-proxy") -> str:
+    """Rewrite external image URLs in markdown to use the local image proxy.
+
+    Replaces ![alt](https://example.com/img.jpg) with
+    ![alt](/api/v1/image-proxy?url=https%3A%2F%2Fexample.com%2Fimg.jpg)
+
+    Skips:
+    - Already-proxied URLs (start with proxy_path)
+    - Data: URLs (inline SVG, no need to proxy)
+    - Relative URLs
+    - Anchors (#...) or empty URLs
+    """
+    import re
+    from urllib.parse import quote
+
+    def repl(match: "re.Match[str]") -> str:
+        alt = match.group(1)
+        url = match.group(2).strip()
+        if not url or url.startswith("#") or url.startswith("data:") or url.startswith(proxy_path):
+            return match.group(0)
+        if url.startswith(("http://", "https://")):
+            encoded = quote(url, safe="")
+            return f"![{alt}]({proxy_path}?url={encoded})"
+        return match.group(0)
+
+    return re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", repl, markdown_text)
+
+
+
 def _llm_event(action: str, phase: str, detail: str = "") -> AgentEvent:
     """Create a timeline event for LLM traces."""
     level: LogLevel = "info"
@@ -154,6 +183,8 @@ class StepfunAgentClient(AgentClient):
                 title=req.title, goal=req.goal,
                 constraints=req.constraints or "(none)",
                 expected_output=req.expected_output or "(none)",
+                priority=req.priority,
+                depth=req.depth,
             )
             try:
                 plan = await self.llm.chat_json(UNDERSTAND_SYSTEM, user_msg, max_tokens=4000, temperature=0.3)
@@ -298,6 +329,7 @@ class StepfunAgentClient(AgentClient):
                     max_tokens=16000,  # bumped from 8000 — 12-section report needs ~16k tokens
                 )
                 report_md = _strip_thinking(report_md, is_json=False)  # remove "Got it, let's..." preamble
+                report_md = _rewrite_image_urls_to_proxy(report_md)  # route external images through proxy
             except LLMError as e:
                 # One retry with smaller prompt
                 logger.warning("report phase first try failed (%s), retrying", e)
