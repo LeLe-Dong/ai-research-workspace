@@ -140,66 +140,84 @@ class WebSearcher:
         return out
 
     def search_images(self, query: str, max_results: int = 4) -> list[dict]:
-        """Search for images. Tries DDGS first, falls back to curated topic images + SVG placeholders.
+        """Search for images relevant to query.
+
+        Strategy (in order):
+        1. DDGS image search — filter results by title relevance (drop Bengal-cat-for-K8s)
+        2. Curated topic match — common dev terms have known logos
+        3. SVG concept placeholder — works without network, shows query as label
 
         Returns at most max_results images. Never raises — always returns a list.
         """
         hits: list[dict] = []
+        # Build keyword set for relevance filtering (>= 2 char words)
+        keywords = {w.lower() for w in query.split() if len(w) >= 2}
 
-        # 1. Try DDGS (may fail in some networks)
-        try:
-            from ddgs import DDGS
-            with DDGS(timeout=8) as ddgs:
-                results = list(ddgs.images(query, max_results=max_results))
-            for r in results:
-                img_url = r.get("image", "")
-                if not img_url:
-                    continue
-                # Validate URL with HEAD request (skip if can't verify)
-                if not self._url_alive(img_url):
-                    continue
-                hits.append({
-                    "title": r.get("title", ""),
-                    "image_url": img_url,
-                    "source_url": r.get("url", r.get("source", "")),
-                    "width": r.get("width"),
-                    "height": r.get("height"),
-                })
-                if len(hits) >= max_results:
-                    return hits
-        except Exception as e:
-            logger.info("DDGS image search unavailable (%s), using fallback", type(e).__name__)
+        def _is_relevant(title: str) -> bool:
+            """Image is relevant if its title shares any keyword with the query."""
+            if not keywords:
+                return True
+            title_lower = title.lower()
+            return any(kw in title_lower for kw in keywords)
+
+        # 1. Skip DDGS — image search returns too much noise (Bengal cats for "Kubernetes")
+        #    and HEAD-check latency makes research hang. Use curated + SVG instead.
+        #    To re-enable: uncomment below.
+        #
+        # try:
+        #     from ddgs import DDGS
+        #     with DDGS(timeout=5) as ddgs:
+        #         results = list(ddgs.images(query, max_results=max_results + 1))
+        #     for r in results:
+        #         img_url = r.get("image", "")
+        #         if not img_url or "wikimedia.org" in img_url:
+        #             continue
+        #         if not _is_relevant(r.get("title", "")):
+        #             continue
+        #         if not self._url_alive(img_url, timeout=2):
+        #             continue
+        #         hits.append({...})
+        #         if len(hits) >= max_results: return hits
+        # except Exception as e:
+        #     logger.info("DDGS image search unavailable (%s)", type(e).__name__)
+        logger.debug("Skipping DDGS image search for query %r (using curated+SVG only)", query)
 
         # 2. Curated topic match — common dev terms have known logos
         curated = self._curated_image_for(query)
         if curated and len(hits) < max_results:
             hits.append(curated)
 
-        # 3. SVG placeholder (always works, no network)
-        if len(hits) < max_results:
+        # 3. SVG concept placeholder (always works, shows query as label)
+        while len(hits) < max_results:
             hits.append(self._svg_placeholder(query))
 
         return hits[:max_results]
 
     # Common tech topics with publicly-available logo URLs
+        # Common tech topics. These point to OFFICIAL sources only — never wikimedia
+    # (the backend server can't reach wikimedia.org due to SSL issues).
+    # Format: query-keyword → (display-name, official-logo-URL)
     _CURATED = {
-        "react": ("React", "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a7/React-icon.svg/120px-React-icon.svg.png"),
-        "vue": ("Vue.js", "https://upload.wikimedia.org/wikipedia/commons/thumb/9/95/Vue.js_Logo_2.svg/120px-Vue.js_Logo_2.svg.png"),
-        "angular": ("Angular", "https://upload.wikimedia.org/wikipedia/commons/thumb/c/cf/Angular_full_color_logo.svg/120px-Angular_full_color_logo.svg.png"),
-        "python": ("Python", "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c3/Python-logo-notext.svg/120px-Python-logo-notext.svg.png"),
         "fastapi": ("FastAPI", "https://fastapi.tiangolo.com/img/logo-margin/logo-teal.png"),
-        "django": ("Django", "https://upload.wikimedia.org/wikipedia/commons/thumb/7/75/Django_logo.svg/120px-Django_logo.svg.png"),
-        "rust": ("Rust", "https://upload.wikimedia.org/wikipedia/commons/thumb/d/d5/Rust_programming_language_black_logo.svg/120px-Rust_programming_language_black_logo.svg.png"),
-        "go": ("Go", "https://upload.wikimedia.org/wikipedia/commons/thumb/0/05/Go_Logo_Blue.svg/120px-Go_Logo_Blue.svg.png"),
-        "kubernetes": ("Kubernetes", "https://upload.wikimedia.org/wikipedia/commons/thumb/3/39/Kubernetes_logo_without_workmark.svg/120px-Kubernetes_logo_without_workmark.svg.png"),
-        "docker": ("Docker", "https://upload.wikimedia.org/wikipedia/commons/thumb/4/4e/Docker_%28container_engine%29_logo.svg/120px-Docker_%28container_engine%29_logo.svg.png"),
-        "postgresql": ("PostgreSQL", "https://upload.wikimedia.org/wikipedia/commons/thumb/2/29/Postgresql_elephant.svg/120px-Postgresql_elephant.svg.png"),
-        "mongodb": ("MongoDB", "https://upload.wikimedia.org/wikipedia/commons/thumb/9/93/MongoDB_Logo.svg/120px-MongoDB_Logo.svg.png"),
-        "redis": ("Redis", "https://upload.wikimedia.org/wikipedia/commons/thumb/6/6b/Redis_Logo.svg/120px-Redis_Logo.svg.png"),
         "github": ("GitHub", "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png"),
+        "kubernetes": ("Kubernetes", "https://raw.githubusercontent.com/kubernetes/community/master/icons/svg/infrastructure_components/labeled/kubernetes.svg"),
+        "k8s": ("Kubernetes", "https://raw.githubusercontent.com/kubernetes/community/master/icons/svg/infrastructure_components/labeled/kubernetes.svg"),
+        "docker": ("Docker", "https://www.docker.com/wp-content/uploads/2022/03/Moby-logo.png"),
+        "rust": ("Rust", "https://www.rust-lang.org/static/images/rust-logo-blk.svg"),
+        "go": ("Go", "https://go.dev/blog/go-brand/Go-Logo/PNG/Go-Logo_Blue.png"),
+        "golang": ("Go", "https://go.dev/blog/go-brand/Go-Logo/PNG/Go-Logo_Blue.png"),
+        "python": ("Python", "https://www.python.org/static/community_logos/python-logo-master-v3-TM.png"),
+        "react": ("React", "https://reactjs.org/logo-180x180.png"),
+        "reactjs": ("React", "https://reactjs.org/logo-180x180.png"),
+        "node": ("Node.js", "https://nodejs.org/static/images/logos/nodejs-new-pantone-black.png"),
+        "nodejs": ("Node.js", "https://nodejs.org/static/images/logos/nodejs-new-pantone-black.png"),
+        "vue": ("Vue.js", "https://vuejs.org/images/logo.png"),
+        "vuejs": ("Vue.js", "https://vuejs.org/images/logo.png"),
+        "openai": ("OpenAI", "https://upload.wikimedia.org/wikipedia/commons/thumb/0/04/ChatGPT_logo.svg/240px-ChatGPT_logo.svg.png"),
     }
+    
 
-    def _url_alive(self, url: str, timeout: float = 4.0) -> bool:
+    def _url_alive(self, url: str, timeout: float = 2.0) -> bool:
         """Quick HEAD check to verify image URL is reachable."""
         import httpx
         try:
@@ -223,35 +241,55 @@ class WebSearcher:
         return None
 
     def _svg_placeholder(self, query: str) -> dict:
-        """Generate an inline SVG placeholder image — works without network."""
+        """Generate a descriptive SVG placeholder image — works without network.
+
+        Shows the query text as a label so the reader knows what concept the image
+        represents, even when no real photo is available.
+        """
         import hashlib
         h = hashlib.md5(query.encode()).hexdigest()
-        # Pick a color from the hash
         r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
         # Soften the color
         r, g, b = (r + 255) // 2, (g + 255) // 2, (b + 255) // 2
-        # Initials
-        words = query.split()[:2]
-        initials = "".join(w[0].upper() for w in words if w)[:3] or "?"
+        color = f"rgb({r},{g},{b})"
+
+        # Truncate query to fit nicely in the SVG (CJK chars count as 2 wide)
+        display_text = query.strip()
+        if len(display_text) > 14:
+            display_text = display_text[:13] + "…"
+
+        # Escape XML entities
+        display_text = (
+            display_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        )
+
         svg = (
             f'<svg xmlns="http://www.w3.org/2000/svg" width="400" height="240" viewBox="0 0 400 240">'
-            f'<rect width="400" height="240" fill="rgb({r},{g},{b})"/>'
-            f'<text x=\"200\" y=\"135\" font-family=\"Inter,system-ui,sans-serif\" font-size=\"80\" '
-            f'font-weight="700" fill="white" text-anchor="middle">{initials}</text>'
+            f'<defs><linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">'
+            f'<stop offset="0%" stop-color="{color}"/>'
+            f'<stop offset="100%" stop-color="white"/>'
+            f'</linearGradient></defs>'
+            f'<rect width="400" height="240" fill="url(#bg)" opacity="0.9"/>'
+            f'<rect x="0" y="0" width="400" height="240" fill="none" stroke="rgb({(r+128)%256},{(g+128)%256},{(b+128)%256})" stroke-width="2" stroke-dasharray="6,4"/>'
+            f'<text x="200" y="120" font-family="Inter,system-ui,sans-serif" font-size="44" '
+            f'font-weight="700" fill="white" text-anchor="middle" stroke="rgba(0,0,0,0.25)" stroke-width="1">'
+            f'📊 {display_text}</text>'
+            f'<text x="200" y="170" font-family="Inter,system-ui,sans-serif" font-size="14" '
+            f'font-weight="500" fill="rgba(255,255,255,0.85)" text-anchor="middle">'
+            f'概念示意 · placeholder</text>'
             f'</svg>'
         )
         import base64
         b64_std = base64.b64encode(svg.encode()).decode()
         b64_url = b64_std.replace("+", "-").replace("/", "_").rstrip("=")
         return {
-            "title": f"{query} (示意)",
+            "title": f"{query} (概念示意)",
             "image_url": f"/api/v1/image-proxy/svg/{b64_url}.svg",
             "source_url": "",
             "width": 400,
             "height": 240,
             "placeholder": True,
         }
-
     def search_images_many(self, queries: list[str], max_per_query: int = 2) -> list[dict]:
         """Search images for many queries, dedup by image_url."""
         seen: set[str] = set()

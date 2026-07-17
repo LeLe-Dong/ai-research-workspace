@@ -142,8 +142,9 @@ class StepfunAgentClient(AgentClient):
         base_url: str = "https://api.stepfun.com/step_plan/v1",
         minimax_api_key: str = "",
         minimax_base_url: str = "https://api.minimaxi.com",
+        llm_timeout: float = 600.0,  # 32k-token reports can take 5+ min
     ):
-        self.llm = StepfunClient(api_key=api_key, base_url=base_url, model=model)
+        self.llm = StepfunClient(api_key=api_key, base_url=base_url, model=model, timeout=llm_timeout)
         # WebSearcher tries MiniMax first, falls back to DDGS
         self.searcher = WebSearcher(
             max_results=4,

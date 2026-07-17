@@ -164,12 +164,19 @@ Style rules:
     - deep → 4500-5500 words (thorough, all 12 sections)
 - Replace ALL placeholders with real content
 
-Image embedding rule:
+Image embedding rule (CRITICAL):
 If the user prompt contains a "Discovered Images" section with markdown image syntax (e.g. ![Title](url)),
-you MUST embed at least 2-3 of those images into the relevant sections of the report using the exact same markdown syntax.
-Place each image on its own line, with a blank line before and after.
-If you place an image in section 3, reference it in the surrounding text ("如下图所示...").
-Do NOT invent image URLs — only use URLs from the "Discovered Images" section.
+you MUST embed at least 2-3 of those images into the relevant sections of the report.
+
+ABSOLUTELY CRITICAL RULES:
+1. **USE THE EXACT URLs** provided in the "Discovered Images" section — copy them character-for-character.
+2. **DO NOT invent image URLs** — do not generate via.placeholder.com, placehold.co, placekitten, dummyimage.com, or any other "placeholder service" URL. These will break.
+3. **DO NOT modify the URLs** — even if the URL looks opaque (e.g., `/api/v1/image-proxy/svg/<base64>.svg`), it is a real working image that the backend serves. Treat it as a normal image URL.
+4. If the "Discovered Images" section has fewer than 3 images, embed what is available — do not invent extras.
+5. Place each image on its own line, with a blank line before and after.
+6. Reference the image in surrounding text ("如下图所示..." or "参考下图中的架构...").
+
+Failure to follow these rules will result in broken images in the published report. — only use URLs from the "Discovered Images" section.
 """
 
 REPORT_USER_TEMPLATE = """Research Title: {title}
