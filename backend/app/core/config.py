@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="AIRW_", env_file=".env", extra="ignore")
 
     app_name: str = "AI 预研工作台"
-    debug: bool = True
+    debug: bool = False  # Set AIRW_DEBUG=true in .env to enable debug logs
 
     # Storage
     db_path: str = "storage/airw.db"
