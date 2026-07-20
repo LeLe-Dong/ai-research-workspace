@@ -10,6 +10,8 @@ import { Loader2, RefreshCw, Check, ArrowRight } from "lucide-react";
 
 import { api, API_BASE } from "@/lib/api";
 import { AGENT_MODE_LABELS, AGENT_MODE_KEYS } from "@/lib/labels-client";
+import { LLMSettingsCard } from "@/features/settings/llm-card";
+import { K8sSettingsCard } from "@/features/settings/k8s-card";
 
 interface HealthData {
   status: string;
@@ -259,6 +261,12 @@ export default function SettingsPage() {
           </div>
         </CardContent>
       </Card>
+
+      {/* LLM model config */}
+      <div className="grid gap-6 md:grid-cols-2">
+        <LLMSettingsCard />
+        <K8sSettingsCard />
+      </div>
 
       {/* Available modes reference */}
       <Card>
