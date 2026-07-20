@@ -66,6 +66,13 @@ export default function SettingsPage() {
   const qc = useQueryClient();
   const [pendingMode, setPendingMode] = useState<string | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
+  // Avoid hydration mismatch: dynamic API data renders as "—" on server, real
+  // values on client. Use mounted flag to render consistent placeholder.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  const safe = <T,>(v: T | undefined, fallback: string = "—"): string => {
+    return mounted ? (v as unknown as string) || fallback : fallback;
+  };
 
   // Poll /admin/agent-mode more frequently when waiting for restart
   const { data: modeInfo, refetch: refetchMode } = useQuery<AgentModeInfo>({
@@ -153,6 +160,18 @@ export default function SettingsPage() {
 
   const pathCount = openapi ? Object.keys(openapi.paths).length : 0;
 
+  if (!mounted) {
+    // Server render: return placeholder that matches first paint
+    return (
+      <div className="container mx-auto max-w-4xl space-y-6 py-6">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">设置</h1>
+          <p className="mt-1 text-sm text-muted-foreground">加载中...</p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="container mx-auto max-w-4xl space-y-6 py-6">
       <div>
@@ -172,13 +191,13 @@ export default function SettingsPage() {
           <div className="grid grid-cols-2 gap-3">
             <div>
               <p className="text-xs text-muted-foreground">服务名</p>
-              <p className="font-mono">{health?.service ?? "—"}</p>
+              <p className="font-mono">{safe(health?.service)}</p>
             </div>
             <div>
               <p className="text-xs text-muted-foreground">状态</p>
               <p>
                 <Badge variant={health?.status === "ok" ? "success" : "destructive"} className="h-4 px-1.5 text-[10px]">
-                  {health?.status ?? "连接中..."}
+                  {safe(health?.status, "连接中...")}
                 </Badge>
               </p>
             </div>
@@ -186,17 +205,19 @@ export default function SettingsPage() {
               <p className="text-xs text-muted-foreground">智能体模式</p>
               <p>
                 <Badge variant="info" className="h-4 px-1.5 text-[10px]">
-                  {AGENT_MODE_LABELS[(modeInfo?.mode ?? "mock") as keyof typeof AGENT_MODE_LABELS] ?? modeInfo?.mode ?? "—"}
+                  {mounted 
+                    ? (AGENT_MODE_LABELS[(modeInfo?.mode ?? "mock") as keyof typeof AGENT_MODE_LABELS] ?? modeInfo?.mode ?? "—")
+                    : "—"}
                 </Badge>
                 <span className="ml-2 font-mono text-[10px] text-muted-foreground">
-                  {modeInfo?.mode ?? "—"}
-                  {modeInfo?.source === "db" && <span className="ml-1 text-[9px] text-amber-600">（DB 覆盖）</span>}
+                  {safe(modeInfo?.mode)}
+                  {mounted && modeInfo?.source === "db" && <span className="ml-1 text-[9px] text-amber-600">（DB 覆盖）</span>}
                 </span>
               </p>
             </div>
             <div>
               <p className="text-xs text-muted-foreground">API 端点数</p>
-              <p className="font-mono">{pathCount}</p>
+              <p className="font-mono">{mounted ? pathCount : 0}</p>
             </div>
           </div>
           <p className="text-[10px] text-muted-foreground">
