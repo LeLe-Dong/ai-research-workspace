@@ -19,8 +19,15 @@ logger = logging.getLogger(__name__)
 
 
 async def _create_task_tree(session, research_id: str) -> list[Task]:
-    """Create one Task row per MockAgentClient TASK_TREE entry."""
-    from app.agents.mock import TASK_TREE
+    """Create one Task row per agent TASK_TREE entry.
+
+    Imported lazily to support both Mock and Stepfun agent's TASK_TREE.
+    Stepfun's takes priority (more detailed); falls back to Mock's.
+    """
+    try:
+        from app.agents.stepfun import TASK_TREE
+    except ImportError:
+        from app.agents.mock import TASK_TREE
     tasks: list[Task] = []
     for idx, (phase, name, _desc) in enumerate(TASK_TREE):
         t = Task(

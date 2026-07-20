@@ -3,14 +3,16 @@ import { CheckCircle2, Circle, Loader2, FlaskConical } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
+import { cn } from "@/lib/utils";
 import type { TaskNode } from "@/lib/types";
 
-const PHASE_META: Record<string, { label: string; color: string }> = {
+const PHASE_META: Record<string, { label: string; color: string; icon?: string }> = {
   requirement: { label: "需求分析", color: "bg-blue-500" },
   research: { label: "信息收集", color: "bg-indigo-500" },
   comparison: { label: "对比分析", color: "bg-purple-500" },
   evaluation: { label: "可行性评估", color: "bg-amber-500" },
   report: { label: "报告撰写", color: "bg-emerald-500" },
+  validation: { label: "环境验证 (K8s)", color: "bg-cyan-500", icon: "☸" },
 };
 
 function StatusIcon({ status }: { status: string }) {
@@ -69,17 +71,31 @@ export function TaskTree({ tasks }: { tasks?: TaskNode[] }) {
                   </p>
                 </div>
                 <ul className="space-y-0.5">
-                  {items.map((t) => (
-                    <li key={t.id}>
-                      <div className="group flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-accent/40">
-                        <StatusIcon status={t.status} />
-                        <span className="flex-1 truncate text-xs">{t.name}</span>
-                        {t.progress > 0 && t.progress < 100 && (
-                          <span className="text-[10px] text-muted-foreground">{t.progress}%</span>
-                        )}
-                      </div>
-                    </li>
-                  ))}
+                  {items.map((t) => {
+                    const isK8s = t.phase === "validation";
+                    return (
+                      <li key={t.id}>
+                        <div
+                          className={cn(
+                            "group flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-accent/40",
+                            isK8s && t.status === "running" && "bg-cyan-500/10 ring-1 ring-cyan-500/30 animate-pulse"
+                          )}
+                        >
+                          <StatusIcon status={t.status} />
+                          <span className="flex-1 truncate text-xs">
+                            {isK8s && <span className="mr-1">☸</span>}
+                            {t.name}
+                          </span>
+                          {isK8s && t.status === "done" && (
+                            <span className="text-[10px] text-cyan-600">✓ 集群已验证</span>
+                          )}
+                          {t.progress > 0 && t.progress < 100 && (
+                            <span className="text-[10px] text-muted-foreground">{t.progress}%</span>
+                          )}
+                        </div>
+                      </li>
+                    );
+                  })}
                 </ul>
               </div>
             );
