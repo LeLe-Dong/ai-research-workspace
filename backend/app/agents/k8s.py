@@ -6,30 +6,96 @@ Uses kubectl with the configured kubeconfig (set via /settings).
 import json
 import logging
 import subprocess
+import tempfile
 import time
+import os
+import base64 as _b64
 from typing import AsyncIterator
 
+import yaml
+from fastapi import HTTPException
+from sqlalchemy import select
+
 from app.agents.base import AgentEvent
+from app.core.crypto import encrypt, decrypt
+from app.db.database import get_session
+from app.db.models import K8sCluster
 
 logger = logging.getLogger(__name__)
 
-KUBECONFIG_PATH = "/root/workspace/ai-research-workspace/backend/kubeconfig.yaml"
 DEFAULT_NAMESPACE = "airw-research"
 POD_READY_TIMEOUT_SEC = 30
+FALLBACK_KUBECONFIG_PATH = "/root/workspace/ai-research-workspace/backend/kubeconfig.yaml"
 
 
-def _kubectl(*args: str, json_out: bool = True) -> tuple[int, str, str]:
+async def _load_kubeconfig() -> tuple[str, dict]:
+    """Load the first configured K8s cluster. Returns (path_to_tempfile, meta_dict).
+
+    Strategy: prefer DB-stored config (from /settings UI). Fall back to hardcoded
+    file for development. Writes a temp kubeconfig that kubectl can use.
+    """
+    cluster = None
+    async with get_session() as session:
+        result = await session.execute(select(K8sCluster).order_by(K8sCluster.id))
+        cluster = result.scalars().first()
+
+    if not cluster and os.path.exists(FALLBACK_KUBECONFIG_PATH):
+        # Fall back to file-based config
+        with open(FALLBACK_KUBECONFIG_PATH) as f:
+            config = yaml.safe_load(f)
+        meta = {"name": config.get("clusters", [{}])[0].get("name", "fallback"), "source": "file"}
+        return FALLBACK_KUBECONFIG_PATH, meta
+
+    if not cluster:
+        raise RuntimeError(
+            "No k8s cluster configured. Add one in /settings → K8s 集群."
+        )
+
+    token = decrypt(cluster.bearer_token_enc) if cluster.bearer_token_enc else ""
+    ca = decrypt(cluster.ca_cert_enc) if cluster.ca_cert_enc else ""
+
+    config = {
+        "apiVersion": "v1",
+        "kind": "Config",
+        "clusters": [{
+            "name": cluster.name,
+            "cluster": {
+                "server": cluster.api_server,
+                "insecure-skip-tls-verify": cluster.skip_tls_verify,
+                **({"certificate-authority-data": _b64.b64encode(ca.encode()).decode()} if ca else {}),
+            }
+        }],
+        "contexts": [{
+            "name": "default",
+            "context": {"cluster": cluster.name, "user": cluster.name, "namespace": cluster.default_namespace}
+        }],
+        "current-context": "default",
+        "users": [{
+            "name": cluster.name,
+            "user": {"token": token} if token else {},
+        }],
+    }
+
+    fd, path = tempfile.mkstemp(suffix=".yaml", prefix="airw-k8s-")
+    with os.fdopen(fd, "w") as f:
+        yaml.safe_dump(config, f)
+
+    meta = {"name": cluster.name, "source": "db", "namespace": cluster.default_namespace}
+    return path, meta
+
+
+def _kubectl(kc_path: str, *args: str, json_out: bool = True) -> tuple[int, str, str]:
     """Run kubectl, return (exit_code, stdout, stderr)."""
-    cmd = ["kubectl", "--kubeconfig", KUBECONFIG_PATH, *args]
+    cmd = ["kubectl", "--kubeconfig", kc_path, *args]
     if json_out:
         cmd += ["-o", "json"]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def _kubectl_stream(yaml_manifest: str, *args: str) -> tuple[int, str, str]:
+def _kubectl_stream(kc_path: str, yaml_manifest: str, *args: str) -> tuple[int, str, str]:
     """kubectl apply -f - with given YAML."""
-    cmd = ["kubectl", "--kubeconfig", KUBECONFIG_PATH, *args, "-f", "-"]
+    cmd = ["kubectl", "--kubeconfig", kc_path, *args, "-f", "-"]
     proc = subprocess.run(cmd, input=yaml_manifest, capture_output=True, text=True, timeout=15)
     return proc.returncode, proc.stdout, proc.stderr
 
@@ -53,6 +119,24 @@ async def validate_with_k8s(
     """
     ns = research_namespace or DEFAULT_NAMESPACE
 
+    # 0. Load kubeconfig
+    try:
+        kc_path, kc_meta = await _load_kubeconfig()
+    except Exception as e:
+        yield AgentEvent(
+            phase="validate", level="error",
+            title="未配置 k8s 集群",
+            detail=f"在 /settings 添加: {e}",
+            task_id="task-validate", task_progress=100,
+        )
+        return
+    yield AgentEvent(
+        phase="validate", level="info",
+        title=f"加载集群配置: {kc_meta['name']}",
+        detail=f"来源: {kc_meta['source']} · 命名空间: {kc_meta.get('namespace', '-')}",
+        task_id="task-validate", task_progress=10,
+    )
+
     # 1. Connectivity check
     yield AgentEvent(
         phase="validate", level="info",
@@ -60,7 +144,7 @@ async def validate_with_k8s(
         detail="测试 API server 连通性",
         task_id="task-validate", task_progress=0,
     )
-    rc, out, err = _kubectl("version", "--client=false", json_out=False)
+    rc, out, err = _kubectl(kc_path, "version", "--client=false", json_out=False)
     if rc != 0:
         yield AgentEvent(
             phase="validate", level="error",
@@ -103,7 +187,7 @@ spec:
         cpu: "200m"
         memory: "256Mi"
 """
-    rc, out, err = _kubectl_stream(test_pod, "apply")
+    rc, out, err = _kubectl_stream(kc_path, test_pod, "apply")
     if rc != 0:
         yield AgentEvent(
             phase="validate", level="error",
@@ -133,7 +217,7 @@ spec:
     start = time.time()
     while time.time() - start < POD_READY_TIMEOUT_SEC:
         time.sleep(3)
-        rc, out, err = _kubectl("get", "pod", f"airw-validate-{research_id[:8]}", "-n", ns)
+        rc, out, err = _kubectl(kc_path, "get", "pod", f"airw-validate-{research_id[:8]}", "-n", ns)
         if rc != 0:
             continue
         try:
@@ -164,10 +248,17 @@ spec:
     )
 
     # 5. Cleanup
-    rc, out, err = _kubectl("delete", "pod", f"airw-validate-{research_id[:8]}", "-n", ns, "--wait=false")
+    rc, out, err = _kubectl(kc_path, "delete", "pod", f"airw-validate-{research_id[:8]}", "-n", ns, "--wait=false")
     yield AgentEvent(
         phase="validate", level="success",
         title="k8s 验证收尾完成",
         detail=f"测试 Pod 已清理 · 集群 {node_name or '可访问'}",
         task_id="task-validate", task_progress=100,
     )
+
+    # Cleanup temp kubeconfig
+    if kc_meta["source"] == "db":
+        try:
+            os.unlink(kc_path)
+        except OSError:
+            pass

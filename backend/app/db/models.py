@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import String, Integer, Float, Text, DateTime, ForeignKey, JSON
+from sqlalchemy import String, Integer, Float, Text, DateTime, ForeignKey, JSON, Boolean
 from sqlalchemy import Index
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 import uuid
@@ -171,3 +171,25 @@ class ResearchTag(Base):
 
 # Add tags relationship to Research
 Research.tags = relationship("Tag", secondary="research_tags", back_populates="researches")
+
+class K8sCluster(Base):
+    """User-configured Kubernetes cluster connection for environment validation.
+
+    Secrets (bearer_token, ca_cert) are Fernet-encrypted before being persisted.
+    """
+    __tablename__ = "k8s_clusters"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    api_server: Mapped[str] = mapped_column(String(512), nullable=False)
+    default_namespace: Mapped[str] = mapped_column(String(64), nullable=False, default="airw-research")
+    skip_tls_verify: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    bearer_token_enc: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    ca_cert_enc: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    kubeconfig_yaml: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    last_tested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_test_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_test_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)

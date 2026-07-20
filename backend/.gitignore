@@ -35,3 +35,6 @@ logs/
 # Storage (database + backups)
 storage/
 backups/
+# K8s configs (contain tokens/secrets)
+kubeconfig.yaml
+*.kubeconfig
