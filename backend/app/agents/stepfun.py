@@ -103,6 +103,7 @@ TASK_TREE = [
     ("evaluation", "风险识别", "识别运维、安全和组织风险"),
     ("report", "综合写作", "撰写执行摘要和推荐方案"),
     ("report", "评审打分", "运行 AI 评审员给出客观分数"),
+    ("validation", "环境验证", "在 k8s 集群部署测试 Pod，验证推荐方案"),
 ]
 
 
@@ -406,6 +407,37 @@ class StepfunAgentClient(AgentClient):
             yield AgentEvent(phase="summarize", level="success",
                              title="最终报告完成",
                              detail="", task_id="task-08", task_progress=100)
+
+            # Phase 4.5: K8s ENVIRONMENT VALIDATION (optional, only if report has k8s topics)
+            yield AgentEvent(phase="validate", level="info",
+                             title="环境验证",
+                             detail="检查报告是否涉及 k8s 集群操作",
+                             task_id="task-09", task_progress=0)
+            try:
+                from app.agents.k8s import validate_with_k8s
+                # Only run if report contains k8s keywords (heuristic)
+                k8s_keywords = ("kubernetes", "k8s", "pod", "deployment", "容器", "cluster", "节点", "deploy", "集群")
+                if any(kw in report_md.lower() for kw in k8s_keywords):
+                    async for ev in validate_with_k8s(
+                        research_id=req.research_id,
+                        title=req.title,
+                        goal=req.goal,
+                        recommendations_md=report_md,
+                    ):
+                        # Preserve original task_id for UI DAG
+                        ev.task_id = "task-09"
+                        yield ev
+                else:
+                    yield AgentEvent(phase="validate", level="info",
+                                     title="环境验证已跳过",
+                                     detail="报告不涉及 k8s 集群操作",
+                                     task_id="task-09", task_progress=100)
+            except Exception as e:
+                logger.warning("k8s validation phase failed: %s", e)
+                yield AgentEvent(phase="validate", level="warn",
+                                 title="环境验证未执行",
+                                 detail=f"{type(e).__name__}: {str(e)[:120]}",
+                                 task_id="task-09", task_progress=100)
 
             # Phase 5: REVIEWER
             yield AgentEvent(phase="review", level="info",
