@@ -1,14 +1,15 @@
 from contextlib import asynccontextmanager
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase
 from typing import AsyncIterator
 
 from app.core.config import settings
+from app.db.base import Base
 
 
-class Base(DeclarativeBase):
-    pass
+# `Base` lives in `app.db.base` (isolated leaf module) to break a 3-way
+# import cycle between `database` <-> `core.config` <-> `models`. See
+# app/db/base.py for the rationale.
 
 
 engine = create_async_engine(
