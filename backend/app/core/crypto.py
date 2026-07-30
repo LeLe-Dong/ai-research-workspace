@@ -14,27 +14,35 @@ import base64
 import hashlib
 
 from cryptography.fernet import Fernet
+import binascii
 
 logger = logging.getLogger(__name__)
 
-_DEV_FALLBACK_KEY = b"airw-dev-only-DO-NOT-use-in-prod-aaaaaa"  # 32 bytes
-
 
 def _get_or_warn() -> bytes:
+    """Resolve the Fernet key from env, falling back to a derived one.
+
+    Returns a Fernet-compatible key — a 32 raw-byte buffer **as a base64
+    URL-safe encoded string**. This is what Fernet() expects; passing raw
+    32 bytes raises "Fernet key must be 32 url-safe base64-encoded bytes".
+    """
     raw = os.environ.get("AIRW_ENCRYPTION_KEY", "").strip()
     if raw:
         try:
-            return base64.urlsafe_b64decode(raw.encode())
-        except Exception:
-            pass
-    # Fallback: derive from AIRW_SECRET_KEY or dev key
+            Fernet(raw.encode())  # raises if env value is not a valid Fernet key
+            return raw.encode()
+        except (ValueError, TypeError, binascii.Error) as e:
+            logger.warning(
+                f"AIRW_ENCRYPTION_KEY is set but is NOT a valid Fernet key "
+                f"({type(e).__name__}: {e}). Falling back to a derived dev key. "
+                "Generate a real one: "
+                'python -c "from cryptography.fernet import Fernet; '
+                'print(Fernet.generate_key().decode())"'
+            )
+    # Fallback: derive a 32-byte raw key and base64-urlsafe-encode it (44 chars).
     seed = os.environ.get("AIRW_SECRET_KEY", "").strip() or "airw-dev"
-    derived = hashlib.sha256(seed.encode()).digest()
-    logger.warning(
-        "AIRW_ENCRYPTION_KEY not set — using SHA-256(AIRW_SECRET_KEY || 'airw-dev'). "
-        "Set AIRW_ENCRYPTION_KEY to a Fernet key in production!"
-    )
-    return base64.urlsafe_b64encode(derived + _DEV_FALLBACK_KEY[:0])[:44] + b"==="
+    sha = hashlib.sha256(seed.encode()).digest()  # 32 bytes
+    return base64.urlsafe_b64encode(sha)
 
 
 _FERNET: Fernet | None = None
