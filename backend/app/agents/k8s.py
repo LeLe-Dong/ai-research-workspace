@@ -3,6 +3,7 @@
 Called by stepfun agent as the optional final phase ("环境验证").
 Uses kubectl with the configured kubeconfig (set via /settings).
 """
+import asyncio
 import json
 import logging
 import subprocess
@@ -215,14 +216,33 @@ spec:
     pod_ip = ""
     conditions = []
     start = time.time()
+    poll_env = {**os.environ, "KUBECONFIG": kc_path}
+    poll_pod_name = f"airw-validate-{research_id[:8]}"
+    poll_tick = 0
     while time.time() - start < POD_READY_TIMEOUT_SEC:
-        time.sleep(3)
-        rc, out, err = _kubectl(kc_path, "get", "pod", f"airw-validate-{research_id[:8]}", "-n", ns)
-        if rc != 0:
-            continue
+        await asyncio.sleep(3)
+        poll_tick += 1
+        elapsed = int(time.time() - start)
+        # Non-blocking kubectl get pod via asyncio subprocess; 5s timeout so
+        # we never wedge if the API server hangs.
         try:
-            data = json.loads(out)
-        except json.JSONDecodeError:
+            proc = await asyncio.create_subprocess_exec(
+                "kubectl", "get", "pod", poll_pod_name,
+                "-n", ns, "-o", "json",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=poll_env,
+            )
+            try:
+                out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=5)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                raise RuntimeError("kubectl timed out")
+            if proc.returncode != 0:
+                continue
+            data = json.loads(out_b.decode("utf-8", errors="replace"))
+        except (RuntimeError, json.JSONDecodeError, Exception):
             continue
         status = data.get("status", {})
         final_status = status.get("phase", "Unknown")
@@ -231,6 +251,17 @@ spec:
         node_name = spec.get("nodeName", "")
         conditions = [c.get("type", "") + "=" + c.get("status", "")
                       for c in status.get("conditions", [])]
+        # Yield a per-tick progress event so SSE / timeline stream keeps
+        # moving while we wait (the prior sync-subprocess implementation
+        # blocked the loop and the UI sat at task_progress=60 for 60s).
+        yield AgentEvent(
+            phase="validate", level="info",
+            title=f"pod poll t={elapsed}s (#{poll_tick}): {final_status}",
+            detail=f"node={node_name or '(未调度)'} ip={pod_ip or '-'} ready=" +
+                   ",".join(c for c in conditions if c.startswith("Ready=")) or "-",
+            task_id="task-validate",
+            task_progress=min(85, 60 + poll_tick * 1),
+        )
         if final_status in ("Running", "Succeeded", "Failed"):
             break
 
