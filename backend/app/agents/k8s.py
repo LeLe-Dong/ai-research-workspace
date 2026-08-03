@@ -25,8 +25,48 @@ from app.db.models import K8sCluster
 logger = logging.getLogger(__name__)
 
 DEFAULT_NAMESPACE = "airw-research"
+EXPERIMENT_NAMESPACE_PREFIX = "airw-research-experiments-"
 POD_READY_TIMEOUT_SEC = 30
 FALLBACK_KUBECONFIG_PATH = "/root/workspace/ai-research-workspace/backend/kubeconfig.yaml"
+
+
+def derive_experiment_ns(research_id: str) -> str:
+    """Build the per-research experimental namespace name.
+
+    Format: `airw-research-experiments-<8hex>`. The 8-hex suffix is the
+    first 8 chars of the research_id (which itself is a 12-hex UUID
+    fragment — see Research.gen_id). Short enough to stay inside K8s's
+    63-char DNS-label limit, long enough to be unique in practice.
+    Deterministic so the same research always maps to the same ns.
+    """
+    if not research_id:
+        raise ValueError("research_id is required for derive_experiment_ns")
+    return f"{EXPERIMENT_NAMESPACE_PREFIX}{research_id[:8]}"
+
+
+def _assert_safe_namespace(ns: str) -> None:
+    """Refuse any namespace outside the allow-list.
+
+    Two and only two namespaces are accepted:
+      1. `airw-research` — the existing dev/scratch ns.
+      2. Anything matching `airw-research-experiments-<short>` — generated
+         by derive_experiment_ns().
+
+    Anything else (e.g. `default`, `kube-system`, `prod`, ...) raises
+    RuntimeError. This is the hard-coded contract that backs the LLM
+    guardrail in the agent prompt: even if the LLM is tricked into
+    submitting a manifest pointing at `kube-system`, the backend refuses
+    to apply it (the validator in commit 3 also rejects it earlier).
+    """
+    if ns == DEFAULT_NAMESPACE:
+        return
+    if ns.startswith(EXPERIMENT_NAMESPACE_PREFIX):
+        return
+    raise RuntimeError(
+        f"validate_with_k8s refused to operate in namespace '{ns}'. "
+        f"Allowed: '{DEFAULT_NAMESPACE}' or '{EXPERIMENT_NAMESPACE_PREFIX}*'. "
+        f"Use derive_experiment_ns(research_id) for the experimental ns."
+    )
 
 
 async def _load_kubeconfig() -> tuple[str, dict]:
@@ -101,6 +141,42 @@ def _kubectl_stream(kc_path: str, yaml_manifest: str, *args: str) -> tuple[int, 
     return proc.returncode, proc.stdout, proc.stderr
 
 
+def create_namespace(kc_path: str, ns: str) -> tuple[int, str, str]:
+    """Create a namespace. Idempotent: 'AlreadyExists' is treated as rc=0.
+
+    Used by the validate phase to provision the per-research experimental
+    ns (airw-research-experiments-<8hex>). Caller must already have run
+    _assert_safe_namespace(ns); we re-assert here defensively.
+
+    Why sync subprocess.run (not asyncio.create_subprocess_exec)?
+    This is called from a small init step that runs once per validate
+    invocation, not in a polling loop — the blocking nature doesn't
+    starve SSE the way the sync polling loop did.
+    """
+    _assert_safe_namespace(ns)
+    rc, out, err = _kubectl(kc_path, "create", "namespace", ns, json_out=False)
+    if rc != 0 and "AlreadyExists" in (err or ""):
+        return 0, "", ""
+    return rc, out, err
+
+
+def delete_namespace(kc_path: str, ns: str) -> tuple[int, str, str]:
+    """Delete a namespace. Idempotent: 'NotFound' is treated as rc=0.
+
+    Called from the validate phase's finally block. The 30s timeout is
+    longer than the 15s default because namespace teardown waits for
+    every resource inside to be removed; 15s is often not enough on a
+    busy cluster.
+    """
+    _assert_safe_namespace(ns)
+    cmd = ["kubectl", "--kubeconfig", kc_path, "delete", "namespace", ns,
+           "--ignore-not-found=true", "--wait=false"]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if proc.returncode != 0 and "NotFound" in (proc.stderr or ""):
+        return 0, "", ""
+    return proc.returncode, proc.stdout, proc.stderr
+
+
 async def validate_with_k8s(
     research_id: str,
     title: str,
@@ -119,6 +195,7 @@ async def validate_with_k8s(
       6. Cleanup: delete the test pod
     """
     ns = research_namespace or DEFAULT_NAMESPACE
+    _assert_safe_namespace(ns)
 
     # 0. Load kubeconfig
     try:
