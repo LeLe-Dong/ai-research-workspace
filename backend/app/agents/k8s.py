@@ -310,6 +310,23 @@ spec:
         task_id="task-validate", task_progress=50,
     )
 
+    # Record the apply in research_resources so commit 4's table-driven
+    # cleanup can find it. Failure to record is non-fatal — log and
+    # continue (the safety_net path will pick it up if we crashed).
+    from app.agents.k8s_cleanup import record_resource
+    test_pod_name = f"airw-validate-{research_id[:8]}"
+    try:
+        await record_resource(
+            research_id=research_id,
+            kind="Pod",
+            name=test_pod_name,
+            namespace=ns,
+            manifest_json=test_pod,
+            cluster_name=kc_meta.get("name"),
+        )
+    except Exception as e:
+        logger.warning(f"record_resource failed (non-fatal): {e}")
+
     # 3. Wait for scheduling
     yield AgentEvent(
         phase="validate", level="info",
@@ -384,12 +401,22 @@ spec:
         task_id="task-validate", task_progress=90,
     )
 
-    # 5. Cleanup
-    rc, out, err = _kubectl(kc_path, "delete", "pod", f"airw-validate-{research_id[:8]}", "-n", ns, "--wait=false")
+    # 5. Cleanup — table-driven
+    # ADR-002 commit 4: instead of hardcoding `kubectl delete pod`, walk
+    # research_resources for this research_id. The Pod we just applied was
+    # recorded as a row inside the apply step (we'll add the record call
+    # below). The safety-net ensures the row gets deleted even if the
+    # caller's iteration was cut short.
+    from app.agents.k8s_cleanup import cleanup_research_resources
+    cleanup_result = await cleanup_research_resources(kc_path, research_id)
+    summary = cleanup_result.get("summary", "cleanup finished")
+    failed = [it for it in cleanup_result.get("items", []) if it.get("rc", 0) != 0]
+    level = "success" if not failed else "warn"
     yield AgentEvent(
-        phase="validate", level="success",
+        phase="validate", level=level,
         title="k8s 验证收尾完成",
-        detail=f"测试 Pod 已清理 · 集群 {node_name or '可访问'}",
+        detail=f"{summary} · 集群 {node_name or '可访问'}" +
+               (f" · {len(failed)} 个资源未清掉" if failed else ""),
         task_id="task-validate", task_progress=100,
     )
 

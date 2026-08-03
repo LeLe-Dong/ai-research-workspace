@@ -1,0 +1,303 @@
+"""Unit tests for ADR-002 commit 4 — table-driven cleanup + RBAC yaml.
+
+Scope:
+  - record_resource inserts a row with the right shape
+  - cleanup_research_resources iterates rows, calls kubectl delete, and
+    marks deleted_at + cleanup_status='done' on success
+  - Idempotency: row with deleted_at set is skipped (rc=0 silently)
+  - Idempotency: kubectl delete returning NotFound is treated as success
+  - safety_net_cleanup only touches rows in 'pending' (not 'done' / 'failed')
+  - RBAC yaml schema: parses as multi-doc YAML, contains the expected
+    ServiceAccount/Role/RoleBinding, the Role's rules include
+    deployments/services, the forbidden verbs (cluster-wide *) are
+    NOT in the rules
+"""
+import json
+import pytest
+from datetime import datetime
+from unittest.mock import patch, MagicMock
+
+from app.db.database import init_db, get_session
+from app.db.models import Research, ResearchResource
+
+
+# ─────────────────── record_resource ───────────────────
+
+@pytest.mark.asyncio
+async def test_record_resource_inserts_row():
+    await init_db()
+    async with get_session() as session:
+        r = Research(
+            title="rr-insert", goal="x", depth="quick", priority="low",
+        )
+        session.add(r)
+        await session.flush()
+        rid = r.id
+    # Now record
+    from app.agents.k8s_cleanup import record_resource
+    row_id = await record_resource(
+        research_id=rid,
+        kind="Pod",
+        name="test-pod",
+        namespace="airw-research",
+        manifest_json='{"kind":"Pod"}',
+        cluster_name="dev-cluster",
+    )
+    assert row_id > 0
+
+    # Verify it was inserted
+    async with get_session() as session:
+        rows = (await session.execute(
+            __import__("sqlalchemy").select(ResearchResource).where(
+                ResearchResource.research_id == rid
+            )
+        )).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].kind == "Pod"
+        assert rows[0].name == "test-pod"
+        assert rows[0].namespace == "airw-research"
+        assert rows[0].cluster_name == "dev-cluster"
+        assert rows[0].cleanup_status == "pending"
+        assert rows[0].deleted_at is None
+
+
+# ─────────────────── cleanup_research_resources ───────────────────
+
+@pytest.mark.asyncio
+async def test_cleanup_marks_done_on_success(monkeypatch):
+    """When kubectl delete returns rc=0, the row gets deleted_at +
+    cleanup_status='done'."""
+    await init_db()
+    async with get_session() as session:
+        r = Research(title="c1", goal="x", depth="quick", priority="low")
+        session.add(r)
+        await session.flush()
+        rid = r.id
+        rr = ResearchResource(
+            research_id=rid, kind="Pod", name="p1",
+            namespace="airw-research", manifest_json="",
+        )
+        session.add(rr)
+        await session.commit()
+
+    fake = MagicMock(returncode=0, stdout="pod deleted", stderr="")
+    monkeypatch.setattr(
+        "app.agents.k8s_cleanup._kubectl",
+        lambda *a, **kw: (0, "pod deleted", ""),
+    )
+
+    from app.agents.k8s_cleanup import cleanup_research_resources
+    result = await cleanup_research_resources("/tmp/fake.kubeconfig", rid)
+    assert "items" in result
+    assert len(result["items"]) == 1
+    assert result["items"][0]["rc"] == 0
+    assert result["items"][0]["deleted_at"] is not None
+
+    async with get_session() as session:
+        from sqlalchemy import select
+        row = (await session.execute(
+            select(ResearchResource).where(
+                ResearchResource.research_id == rid
+            )
+        )).scalars().one()
+        assert row.deleted_at is not None
+        assert row.cleanup_status == "done"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_idempotent_on_already_done(monkeypatch):
+    """A row that already has deleted_at set is skipped — no kubectl call."""
+    await init_db()
+    async with get_session() as session:
+        r = Research(title="c2", goal="x", depth="quick", priority="low")
+        session.add(r)
+        await session.flush()
+        rid = r.id
+        rr = ResearchResource(
+            research_id=rid, kind="Pod", name="p2",
+            namespace="airw-research",
+            deleted_at=datetime.utcnow(),
+            cleanup_status="done",
+        )
+        session.add(rr)
+        await session.commit()
+
+    called = []
+    def fake_kubectl(*a, **kw):
+        called.append(a)
+        return 0, "", ""
+    monkeypatch.setattr("app.agents.k8s_cleanup._kubectl", fake_kubectl)
+
+    from app.agents.k8s_cleanup import cleanup_research_resources
+    result = await cleanup_research_resources("/tmp/fake.kubeconfig", rid)
+    assert result["items"][0]["skipped"] is True
+    assert called == [], "kubectl must NOT be called for already-cleaned rows"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_idempotent_on_notfound(monkeypatch):
+    """kubectl delete returning rc=1 + 'NotFound' in stderr is treated as success."""
+    await init_db()
+    async with get_session() as session:
+        r = Research(title="c3", goal="x", depth="quick", priority="low")
+        session.add(r)
+        await session.flush()
+        rid = r.id
+        rr = ResearchResource(
+            research_id=rid, kind="Pod", name="p3",
+            namespace="airw-research",
+        )
+        session.add(rr)
+        await session.commit()
+
+    monkeypatch.setattr(
+        "app.agents.k8s_cleanup._kubectl",
+        lambda *a, **kw: (1, "", 'Error from server (NotFound): pods "p3" not found\n'),
+    )
+
+    from app.agents.k8s_cleanup import cleanup_research_resources
+    result = await cleanup_research_resources("/tmp/fake.kubeconfig", rid)
+    assert result["items"][0]["rc"] == 0, "NotFound must be treated as success"
+    assert result["items"][0]["deleted_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_marks_failed_on_real_error(monkeypatch):
+    """kubectl delete returning rc!=0 without NotFound marks row as failed."""
+    await init_db()
+    async with get_session() as session:
+        r = Research(title="c4", goal="x", depth="quick", priority="low")
+        session.add(r)
+        await session.flush()
+        rid = r.id
+        rr = ResearchResource(
+            research_id=rid, kind="Pod", name="p4",
+            namespace="airw-research",
+        )
+        session.add(rr)
+        await session.commit()
+
+    monkeypatch.setattr(
+        "app.agents.k8s_cleanup._kubectl",
+        lambda *a, **kw: (1, "", "forbidden: User cannot list pods"),
+    )
+
+    from app.agents.k8s_cleanup import cleanup_research_resources
+    result = await cleanup_research_resources("/tmp/fake.kubeconfig", rid)
+    assert result["items"][0]["rc"] == 1
+    assert result["items"][0]["deleted_at"] is None
+
+    async with get_session() as session:
+        from sqlalchemy import select
+        row = (await session.execute(
+            select(ResearchResource).where(
+                ResearchResource.research_id == rid
+            )
+        )).scalars().one()
+        assert row.cleanup_status == "failed"
+        assert row.deleted_at is None
+
+
+# ─────────────────── safety_net_cleanup ───────────────────
+
+@pytest.mark.asyncio
+async def test_safety_net_only_touches_pending(monkeypatch):
+    """safety_net_cleanup must only act on 'pending' rows, leaving
+    'done' / 'failed' / 'running' alone."""
+    await init_db()
+    async with get_session() as session:
+        r = Research(title="sn1", goal="x", depth="quick", priority="low")
+        session.add(r)
+        await session.flush()
+        rid = r.id
+        # 3 rows in 3 different states
+        session.add(ResearchResource(research_id=rid, kind="Pod", name="p-pending",
+                                       namespace="airw-research",
+                                       cleanup_status="pending"))
+        session.add(ResearchResource(research_id=rid, kind="Pod", name="p-done",
+                                       namespace="airw-research",
+                                       cleanup_status="done",
+                                       deleted_at=datetime.utcnow()))
+        session.add(ResearchResource(research_id=rid, kind="Pod", name="p-failed",
+                                       namespace="airw-research",
+                                       cleanup_status="failed"))
+        await session.commit()
+
+    touched = []
+    def fake_kubectl(*a, **kw):
+        # _kubectl signature: _kubectl(kc_path, "delete", KIND, NAME, "-n", NS, ...)
+        # a[0] is kc_path (not in *args); a[1]='delete', a[2]=KIND, a[3]=NAME
+        touched.append((a[2], a[3]))  # (kind, name)
+        return 0, "", ""
+    monkeypatch.setattr("app.agents.k8s_cleanup._kubectl", fake_kubectl)
+
+    from app.agents.k8s_cleanup import safety_net_cleanup
+    n = await safety_net_cleanup("/tmp/fake.kubeconfig", rid)
+    assert n == 1, f"only the pending row should be touched; got {n}"
+    assert touched == [("pod", "p-pending")]
+
+
+# ─────────────────── RBAC yaml ───────────────────
+
+def test_rbac_yaml_parses():
+    """The yaml is multi-document. PyYAML needs safe_load_all."""
+    import yaml
+    from pathlib import Path
+    p = Path("/root/workspace/ai-research-workspace/infra/k8s/rbac/airw-bot-role.yaml")
+    docs = list(yaml.safe_load_all(p.read_text()))
+    assert len(docs) >= 6, f"expected ≥6 docs (2 SA + 2 Role + 2 RoleBinding), got {len(docs)}"
+    kinds = [d.get("kind") for d in docs if d]
+    assert kinds.count("ServiceAccount") == 2
+    assert kinds.count("Role") == 2
+    assert kinds.count("RoleBinding") == 2
+
+
+def test_rbac_role_includes_deployments():
+    import yaml
+    from pathlib import Path
+    p = Path("/root/workspace/ai-research-workspace/infra/k8s/rbac/airw-bot-role.yaml")
+    docs = list(yaml.safe_load_all(p.read_text()))
+    roles = [d for d in docs if d and d.get("kind") == "Role"]
+    assert len(roles) >= 1
+    for role in roles:
+        apps_rules = [r for r in role["rules"] if r.get("apiGroups") == ["apps"]]
+        assert apps_rules, "Role must have an apps rule"
+        assert "deployments" in apps_rules[0]["resources"]
+
+
+def test_rbac_role_does_not_allow_wildcard():
+    """The Role must not have rules with verbs=['*'] or resources=['*'] —
+    that would give the agent cluster-admin power, defeating the point
+    of RBAC scoping."""
+    import yaml
+    from pathlib import Path
+    p = Path("/root/workspace/ai-research-workspace/infra/k8s/rbac/airw-bot-role.yaml")
+    docs = list(yaml.safe_load_all(p.read_text()))
+    for d in docs:
+        if not d or d.get("kind") != "Role":
+            continue
+        for rule in d.get("rules", []):
+            assert "*" not in rule.get("verbs", []), (
+                f"Role {d['metadata']['name']} has wildcard verbs: {rule}"
+            )
+            assert "*" not in rule.get("resources", []), (
+                f"Role {d['metadata']['name']} has wildcard resources: {rule}"
+            )
+
+
+def test_rbac_role_does_not_include_nodes_or_namespaces():
+    """nodes / namespaces / persistentvolumes are deliberately NOT in
+    this Role (cluster-scoped). Re-introducing them is a security event."""
+    import yaml
+    from pathlib import Path
+    p = Path("/root/workspace/ai-research-workspace/infra/k8s/rbac/airw-bot-role.yaml")
+    docs = list(yaml.safe_load_all(p.read_text()))
+    for d in docs:
+        if not d or d.get("kind") != "Role":
+            continue
+        for rule in d.get("rules", []):
+            for r in rule.get("resources", []):
+                assert r not in {"nodes", "namespaces", "persistentvolumes",
+                                  "clusterrolebindings", "clusterroles"}, (
+                    f"Role {d['metadata']['name']} grants cluster-scoped resource {r!r}"
+                )
