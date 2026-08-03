@@ -193,3 +193,50 @@ class K8sCluster(Base):
     last_test_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class ResearchResource(Base):
+    """K8s resources created on behalf of a research's validate phase.
+
+    Why this table exists
+    ---------------------
+    Before this table, the only cleanup mechanism for K8s resources created
+    during research validation was a kubectl delete with the `app=airw-validate`
+    label selector (see app.agents.k8s._safety_net_cleanup). That worked when
+    the only resource created was the test pod — but once we let the AI
+    submit arbitrary manifests (post ADR-002), we lose the ability to know
+    what was created. This table is the authoritative list: every manifest
+    the backend validates + applies gets one row here, with the full YAML
+    preserved for diff/audit. Cleanup is then "iterate rows for this
+    research_id, kubectl delete each, mark deleted_at when gone".
+
+    Rows are created at apply time (kind='Namespace' is the per-research
+    experimental ns) and soft-deleted (deleted_at + cleanup_status='done')
+    once kubectl confirms the resource is gone. If a backend crash orphans
+    rows (cleanup_status='pending' with no deleted_at), the next research
+    run on the same id — or a manual sweep job — can re-attempt cleanup
+    from this table instead of relying on labels alone.
+    """
+    __tablename__ = "research_resources"
+    __table_args__ = (
+        Index("ix_research_resources_research_cleanup",
+              "research_id", "cleanup_status"),
+        Index("ix_research_resources_namespace",
+              "namespace"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    research_id: Mapped[str] = mapped_column(
+        String(12), ForeignKey("researches.id", ondelete="CASCADE"), nullable=False,
+    )
+    # Pod / Deployment / StatefulSet / Service / ConfigMap / PVC / Secret / Namespace
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    namespace: Mapped[str] = mapped_column(String(64), nullable=False)
+    manifest_json: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    cluster_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cleanup_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending",
+    )  # pending / running / done / failed
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
