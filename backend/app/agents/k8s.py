@@ -183,6 +183,7 @@ async def validate_with_k8s(
     goal: str,
     recommendations_md: str,
     research_namespace: str | None = None,
+    manifest: dict | list | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Spin up a test pod based on research recommendations and report status.
 
@@ -193,11 +194,39 @@ async def validate_with_k8s(
       4. Capture: node assignment, resource requests, status, conditions
       5. Emit AgentEvents for each phase
       6. Cleanup: delete the test pod
+
+    If `manifest` is supplied, it is validated by ManifestValidator (see
+    app/agents/k8s_manifest). A failed validation short-circuits with a
+    warn-level AgentEvent listing every rejection — the caller learns
+    why the manifest was unsafe without the cluster ever seeing it.
+    The actual apply path is wired up in commit 4 (which also writes
+    research_resources rows); commit 3 only adds the validation step.
     """
     ns = research_namespace or DEFAULT_NAMESPACE
     _assert_safe_namespace(ns)
 
-    # 0. Load kubeconfig
+    # 0. Validate any caller-supplied manifest before touching the cluster.
+    if manifest is not None:
+        from app.agents.k8s_manifest import validate_manifest
+        result = validate_manifest(manifest)
+        if not result.ok:
+            yield AgentEvent(
+                phase="validate", level="warn",
+                title="manifest 验证失败",
+                detail=result.summary(),
+                task_id="task-validate", task_progress=100,
+            )
+            return
+        # Success path: surface a brief ack. Commit 4 will pick this up
+        # to actually apply the manifests and write research_resources.
+        yield AgentEvent(
+            phase="validate", level="info",
+            title="manifest 验证通过",
+            detail=f"{len(result.manifests)} 个资源 + ns={ns}",
+            task_id="task-validate", task_progress=5,
+        )
+
+    # 1. Load kubeconfig
     try:
         kc_path, kc_meta = await _load_kubeconfig()
     except Exception as e:
