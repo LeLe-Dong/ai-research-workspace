@@ -1,4 +1,4 @@
-"""Unit tests for ADR-002 commit 4 — table-driven cleanup + RBAC yaml.
+"""Unit tests for ADR-002 commit 4 — table-driven cleanup.
 
 Scope:
   - record_resource inserts a row with the right shape
@@ -7,10 +7,10 @@ Scope:
   - Idempotency: row with deleted_at set is skipped (rc=0 silently)
   - Idempotency: kubectl delete returning NotFound is treated as success
   - safety_net_cleanup only touches rows in 'pending' (not 'done' / 'failed')
-  - RBAC yaml schema: parses as multi-doc YAML, contains the expected
-    ServiceAccount/Role/RoleBinding, the Role's rules include
-    deployments/services, the forbidden verbs (cluster-wide *) are
-    NOT in the rules
+
+(RBAC yaml tests removed in part 3/4 of the Phase C integration:
+the airw-bot-role.yaml file is gone — Phase C uses the default
+airw-research namespace with the existing dev RBAC.)
 """
 import json
 import pytest
@@ -235,69 +235,3 @@ async def test_safety_net_only_touches_pending(monkeypatch):
     n = await safety_net_cleanup("/tmp/fake.kubeconfig", rid)
     assert n == 1, f"only the pending row should be touched; got {n}"
     assert touched == [("pod", "p-pending")]
-
-
-# ─────────────────── RBAC yaml ───────────────────
-
-def test_rbac_yaml_parses():
-    """The yaml is multi-document. PyYAML needs safe_load_all."""
-    import yaml
-    from pathlib import Path
-    p = Path("/root/workspace/ai-research-workspace/infra/k8s/rbac/airw-bot-role.yaml")
-    docs = list(yaml.safe_load_all(p.read_text()))
-    assert len(docs) >= 6, f"expected ≥6 docs (2 SA + 2 Role + 2 RoleBinding), got {len(docs)}"
-    kinds = [d.get("kind") for d in docs if d]
-    assert kinds.count("ServiceAccount") == 2
-    assert kinds.count("Role") == 2
-    assert kinds.count("RoleBinding") == 2
-
-
-def test_rbac_role_includes_deployments():
-    import yaml
-    from pathlib import Path
-    p = Path("/root/workspace/ai-research-workspace/infra/k8s/rbac/airw-bot-role.yaml")
-    docs = list(yaml.safe_load_all(p.read_text()))
-    roles = [d for d in docs if d and d.get("kind") == "Role"]
-    assert len(roles) >= 1
-    for role in roles:
-        apps_rules = [r for r in role["rules"] if r.get("apiGroups") == ["apps"]]
-        assert apps_rules, "Role must have an apps rule"
-        assert "deployments" in apps_rules[0]["resources"]
-
-
-def test_rbac_role_does_not_allow_wildcard():
-    """The Role must not have rules with verbs=['*'] or resources=['*'] —
-    that would give the agent cluster-admin power, defeating the point
-    of RBAC scoping."""
-    import yaml
-    from pathlib import Path
-    p = Path("/root/workspace/ai-research-workspace/infra/k8s/rbac/airw-bot-role.yaml")
-    docs = list(yaml.safe_load_all(p.read_text()))
-    for d in docs:
-        if not d or d.get("kind") != "Role":
-            continue
-        for rule in d.get("rules", []):
-            assert "*" not in rule.get("verbs", []), (
-                f"Role {d['metadata']['name']} has wildcard verbs: {rule}"
-            )
-            assert "*" not in rule.get("resources", []), (
-                f"Role {d['metadata']['name']} has wildcard resources: {rule}"
-            )
-
-
-def test_rbac_role_does_not_include_nodes_or_namespaces():
-    """nodes / namespaces / persistentvolumes are deliberately NOT in
-    this Role (cluster-scoped). Re-introducing them is a security event."""
-    import yaml
-    from pathlib import Path
-    p = Path("/root/workspace/ai-research-workspace/infra/k8s/rbac/airw-bot-role.yaml")
-    docs = list(yaml.safe_load_all(p.read_text()))
-    for d in docs:
-        if not d or d.get("kind") != "Role":
-            continue
-        for rule in d.get("rules", []):
-            for r in rule.get("resources", []):
-                assert r not in {"nodes", "namespaces", "persistentvolumes",
-                                  "clusterrolebindings", "clusterroles"}, (
-                    f"Role {d['metadata']['name']} grants cluster-scoped resource {r!r}"
-                )

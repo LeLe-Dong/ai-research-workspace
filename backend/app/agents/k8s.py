@@ -215,48 +215,24 @@ async def validate_with_k8s(
     goal: str,
     recommendations_md: str,
     research_namespace: str | None = None,
-    manifest: dict | list | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Spin up a test pod based on research recommendations and report status.
 
     Steps:
-      1. Extract deployment recommendations from report (k8s-related only)
-      2. Apply a minimal test pod/manifest in research namespace
-      3. Wait for pod to be scheduled (Pending→Running, or stay Pending)
-      4. Capture: node assignment, resource requests, status, conditions
-      5. Emit AgentEvents for each phase
-      6. Cleanup: delete the test pod
+      1. Load kubeconfig (DB-stored cluster or file fallback)
+      2. Safety-net: sweep any orphaned resources from prior crashed runs
+      3. Pick workload (Phase C) from goal + recommendations
+      4. Apply benchmark pod
+      5. Wait for scheduling + capture benchmark output
+      6. Persist validation_result as a k8s-validation Artifact
+      7. Cleanup: table-driven via research_resources
 
-    If `manifest` is supplied, it is validated by ManifestValidator (see
-    app/agents/k8s_manifest). A failed validation short-circuits with a
-    warn-level AgentEvent listing every rejection — the caller learns
-    why the manifest was unsafe without the cluster ever seeing it.
-    The actual apply path is wired up in commit 4 (which also writes
-    research_resources rows); commit 3 only adds the validation step.
+    Phase C uses backend-provided workload templates (app.agents.k8s_workload),
+    not LLM-submitted manifests. Defense-in-depth remains via the namespace
+    allow-list (_assert_safe_namespace).
     """
     ns = research_namespace or DEFAULT_NAMESPACE
     _assert_safe_namespace(ns)
-
-    # 0. Validate any caller-supplied manifest before touching the cluster.
-    if manifest is not None:
-        from app.agents.k8s_manifest import validate_manifest
-        result = validate_manifest(manifest)
-        if not result.ok:
-            yield AgentEvent(
-                phase="validate", level="warn",
-                title="manifest 验证失败",
-                detail=result.summary(),
-                task_id="task-validate", task_progress=100,
-            )
-            return
-        # Success path: surface a brief ack. Commit 4 will pick this up
-        # to actually apply the manifests and write research_resources.
-        yield AgentEvent(
-            phase="validate", level="info",
-            title="manifest 验证通过",
-            detail=f"{len(result.manifests)} 个资源 + ns={ns}",
-            task_id="task-validate", task_progress=5,
-        )
 
     # 1. Load kubeconfig
     try:
@@ -266,14 +242,14 @@ async def validate_with_k8s(
             phase="validate", level="error",
             title="未配置 k8s 集群",
             detail=f"在 /settings 添加: {e}",
-            task_id="task-validate", task_progress=100,
+            task_id="task-10", task_progress=100,
         )
         return
     yield AgentEvent(
         phase="validate", level="info",
         title=f"加载集群配置: {kc_meta['name']}",
         detail=f"来源: {kc_meta['source']} · 命名空间: {kc_meta.get('namespace', '-')}",
-        task_id="task-validate", task_progress=10,
+        task_id="task-10", task_progress=10,
     )
 
     # 1. Connectivity check
@@ -281,7 +257,7 @@ async def validate_with_k8s(
         phase="validate", level="info",
         title="连接 k8s 集群",
         detail="测试 API server 连通性",
-        task_id="task-validate", task_progress=0,
+        task_id="task-10", task_progress=0,
     )
     rc, out, err = _kubectl(kc_path, "version", "--client=false", json_out=False)
     if rc != 0:
@@ -289,7 +265,7 @@ async def validate_with_k8s(
             phase="validate", level="error",
             title="k8s 集群不可达",
             detail=f"kubectl 失败: {err[:200]}",
-            task_id="task-validate", task_progress=100,
+            task_id="task-10", task_progress=100,
         )
         return
     yield AgentEvent(
@@ -343,14 +319,14 @@ async def validate_with_k8s(
             phase="validate", level="error",
             title="部署失败",
             detail=f"{err[:200]}",
-            task_id="task-validate", task_progress=100,
+            task_id="task-10", task_progress=100,
         )
         return
     yield AgentEvent(
         phase="validate", level="success",
         title="测试 Pod 已创建",
         detail=out.strip(),
-        task_id="task-validate", task_progress=50,
+        task_id="task-10", task_progress=50,
     )
 
     # Record the apply in research_resources so commit 4's table-driven
