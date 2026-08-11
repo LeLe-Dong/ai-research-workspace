@@ -14,6 +14,12 @@ import base64 as _b64
 from typing import AsyncIterator
 
 import yaml
+
+from app.agents.k8s_workload import (
+    build_test_pod_yaml,
+    detect_workload,
+    get_workload,
+)
 from fastapi import HTTPException
 from sqlalchemy import select
 
@@ -289,36 +295,47 @@ async def validate_with_k8s(
         phase="validate", level="success",
         title="k8s 集群连接成功",
         detail=out.strip(),
-        task_id="task-validate", task_progress=20,
+        task_id="task-10", task_progress=20,
     )
 
-    # 2. Apply test pod
+    # 1.5 Safety net: clean up any orphaned resources from a prior
+    # crashed run for this same research_id. Belt-and-suspenders
+    # alongside the table-driven cleanup_research_resources below.
+    from app.agents.k8s_cleanup import safety_net_cleanup
+    try:
+        orphan_count = await safety_net_cleanup(kc_path, research_id)
+        if orphan_count > 0:
+            yield AgentEvent(
+                phase="validate", level="warn",
+                title=f"清理 {orphan_count} 个孤儿资源",
+                detail="来自之前未正常完成的验证运行",
+                task_id="task-10", task_progress=22,
+            )
+    except Exception as e:
+        logger.warning("safety_net_cleanup failed (non-fatal): %s", e)
+
+    # 2. Phase C: pick a workload based on the research goal, then
+    # apply a real benchmark pod. This replaces the previous fixed
+    # nginx:alpine pod with a workload that matches the topic
+    # (postgres / redis / web / AI / generic).
+    workload_key = detect_workload(goal, recommendations_md)
+    workload = get_workload(workload_key)
+    yield AgentEvent(
+        phase="validate", level="info",
+        title=f"工作负载选择: {workload.name}",
+        detail=f"{workload.description}（基于 goal + LLM 报告自动匹配）",
+        task_id="task-10", task_progress=25,
+    )
     yield AgentEvent(
         phase="validate", level="info",
         title="部署测试 Pod",
-        detail=f"命名空间 {ns}",
-        task_id="task-validate", task_progress=30,
+        detail=f"命名空间 {ns} · 镜像 {workload.image}",
+        task_id="task-10", task_progress=30,
     )
-    test_pod = f"""apiVersion: v1
-kind: Pod
-metadata:
-  name: airw-validate-{research_id[:8]}
-  namespace: {ns}
-  labels:
-    airw-research: "{research_id}"
-spec:
-  restartPolicy: Never
-  containers:
-  - name: validate
-    image: nginx:alpine
-    resources:
-      requests:
-        cpu: "50m"
-        memory: "64Mi"
-      limits:
-        cpu: "200m"
-        memory: "256Mi"
-"""
+    test_pod = build_test_pod_yaml(
+        workload, research_id, ns,
+        timeout_sec=workload.timeout_sec,
+    )
     rc, out, err = _kubectl_stream(kc_path, test_pod, "apply")
     if rc != 0:
         yield AgentEvent(
@@ -339,7 +356,7 @@ spec:
     # cleanup can find it. Failure to record is non-fatal — log and
     # continue (the safety_net path will pick it up if we crashed).
     from app.agents.k8s_cleanup import record_resource
-    test_pod_name = f"airw-validate-{research_id[:8]}"
+    test_pod_name = f"airw-bench-{research_id[:8]}"
     try:
         await record_resource(
             research_id=research_id,
