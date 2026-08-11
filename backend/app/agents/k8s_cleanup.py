@@ -34,7 +34,7 @@ from datetime import datetime
 
 from sqlalchemy import select
 
-from app.agents.k8s import _kubectl
+from app.agents.k8s import _kubectl_async
 from app.db.database import get_session
 from app.db.models import ResearchResource
 
@@ -87,12 +87,11 @@ async def cleanup_research_resources(
     (returns rc=0 silently). A kubectl delete that returns NotFound
     is also treated as success.
 
-    Sync wrapper note: _kubectl is sync (subprocess.run). We do NOT
-    wrap it in asyncio — the surrounding caller is the async
-    validate_with_k8s generator, which is already structured to
-    tolerate blocking calls inside `async for`. We keep this function
-    async to match the rest of the k8s.py surface and to make the
-    caller code uniform.
+    Implementation note: each row delete runs through
+    _kubectl_async (added in part 4b), so a row-loop over many
+    resources doesn't block the SSE event loop — the await yields
+    between rows. The cleanup_research_resources function is still
+    async (signature preserved) so existing callers don't change.
     """
     results: list[dict] = []
     async with get_session() as session:
@@ -124,17 +123,21 @@ async def cleanup_research_resources(
             row.cleanup_status = "running"
             await session.commit()
 
-        # The actual delete: namespace is special-cased (delete --wait=false)
+        # The actual delete: namespace is special-cased (delete --wait=false).
+        # _kubectl_async is non-blocking — the row-level loop runs N
+        # rows but no single row starves the SSE event loop for >15s.
         if r.kind == "Namespace":
-            rc, out, err = _kubectl(
-                kc_path, "delete", "namespace", r.name,
-                "--ignore-not-found=true", "--wait=false", json_out=False,
+            rc, out, err = await _kubectl_async(
+                ["--kubeconfig", kc_path, "delete", "namespace", r.name,
+                 "--ignore-not-found=true", "--wait=false"],
+                timeout=15,
             )
         else:
-            rc, out, err = _kubectl(
-                kc_path, "delete", r.kind.lower(), r.name,
-                "-n", r.namespace, "--ignore-not-found=true",
-                "--wait=false", json_out=False,
+            rc, out, err = await _kubectl_async(
+                ["--kubeconfig", kc_path, "delete", r.kind.lower(), r.name,
+                 "-n", r.namespace, "--ignore-not-found=true",
+                 "--wait=false"],
+                timeout=15,
             )
 
         # Idempotent: NotFound on the cluster is success
@@ -173,11 +176,9 @@ async def safety_net_cleanup(kc_path: str, research_id: str) -> int:
     'done'), the resource may still exist on the cluster from a prior
     crashed run. Force-kill it. Returns the number of rows touched.
 
-    Distinct from cleanup_research_resources: this is the
-    "find-orphans" path, not the "happy path" path. It is called
-    at the start of validate_with_k8s (before the new apply) and
-    once at the end (after the happy-path cleanup) as a final
-    safety net.
+    Called at the start of validate_with_k8s to clean up orphans from
+    prior crashed runs, and once at the end (after the happy-path cleanup)
+    as a final safety net.
     """
     touched = 0
     async with get_session() as session:
@@ -189,21 +190,40 @@ async def safety_net_cleanup(kc_path: str, research_id: str) -> int:
         )).scalars().all()
 
     for r in pending:
-        if r.kind == "Namespace":
-            _kubectl(kc_path, "delete", "namespace", r.name,
-                     "--ignore-not-found=true", "--wait=false", json_out=False)
-        else:
-            _kubectl(kc_path, "delete", r.kind.lower(), r.name,
+        rc = 0
+        err = ""
+        try:
+            if r.kind == "Namespace":
+                rc, out, err = await _kubectl_async(
+                    ["--kubeconfig", kc_path, "delete", "namespace", r.name,
+                     "--ignore-not-found=true", "--wait=false"],
+                    timeout=15,
+                )
+            else:
+                rc, out, err = await _kubectl_async(
+                    ["--kubeconfig", kc_path, "delete", r.kind.lower(), r.name,
                      "-n", r.namespace, "--ignore-not-found=true",
-                     "--wait=false", json_out=False)
+                     "--wait=false"],
+                    timeout=15,
+                )
+            if rc != 0 and "NotFound" in (err or ""):
+                rc = 0
+        except Exception as e:
+            logger.warning("safety_net _kubectl_async failed for %s/%s: %s", r.kind, r.name, e)
+            rc = 1
+            err = str(e)
+
         async with get_session() as session:
             row = (await session.execute(
                 select(ResearchResource).where(
                     ResearchResource.id == r.id
                 )
             )).scalars().one()
-            row.deleted_at = datetime.utcnow()
-            row.cleanup_status = "done"
+            if rc == 0:
+                row.deleted_at = datetime.utcnow()
+                row.cleanup_status = "done"
+            else:
+                row.cleanup_status = "failed"
             await session.commit()
         touched += 1
     return touched

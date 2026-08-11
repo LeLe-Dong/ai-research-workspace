@@ -21,6 +21,18 @@ from app.db.database import init_db, get_session
 from app.db.models import Research, ResearchResource
 
 
+def _async_fake(*, rc: int, out: str = "", err: str = ""):
+    """Build an async fake matching the _kubectl_async signature.
+
+    Use this as the replacement for monkeypatch.setattr() targets
+    that previously pointed at the sync _kubectl helper. _kubectl_async
+    is awaited, so the mock must return a coroutine, not a tuple.
+    """
+    async def fake(*a, **kw):
+        return rc, out, err
+    return fake
+
+
 # ─────────────────── record_resource ───────────────────
 
 @pytest.mark.asyncio
@@ -82,8 +94,8 @@ async def test_cleanup_marks_done_on_success(monkeypatch):
 
     fake = MagicMock(returncode=0, stdout="pod deleted", stderr="")
     monkeypatch.setattr(
-        "app.agents.k8s_cleanup._kubectl",
-        lambda *a, **kw: (0, "pod deleted", ""),
+        "app.agents.k8s_cleanup._kubectl_async",
+        _async_fake(rc=0, out="pod deleted", err=""),
     )
 
     from app.agents.k8s_cleanup import cleanup_research_resources
@@ -123,10 +135,10 @@ async def test_cleanup_idempotent_on_already_done(monkeypatch):
         await session.commit()
 
     called = []
-    def fake_kubectl(*a, **kw):
+    async def fake_kubectl_async(*a, **kw):
         called.append(a)
         return 0, "", ""
-    monkeypatch.setattr("app.agents.k8s_cleanup._kubectl", fake_kubectl)
+    monkeypatch.setattr("app.agents.k8s_cleanup._kubectl_async", fake_kubectl_async)
 
     from app.agents.k8s_cleanup import cleanup_research_resources
     result = await cleanup_research_resources("/tmp/fake.kubeconfig", rid)
@@ -151,8 +163,8 @@ async def test_cleanup_idempotent_on_notfound(monkeypatch):
         await session.commit()
 
     monkeypatch.setattr(
-        "app.agents.k8s_cleanup._kubectl",
-        lambda *a, **kw: (1, "", 'Error from server (NotFound): pods "p3" not found\n'),
+        "app.agents.k8s_cleanup._kubectl_async",
+        _async_fake(rc=1, out="", err='Error from server (NotFound): pods "p3" not found\n'),
     )
 
     from app.agents.k8s_cleanup import cleanup_research_resources
@@ -178,8 +190,8 @@ async def test_cleanup_marks_failed_on_real_error(monkeypatch):
         await session.commit()
 
     monkeypatch.setattr(
-        "app.agents.k8s_cleanup._kubectl",
-        lambda *a, **kw: (1, "", "forbidden: User cannot list pods"),
+        "app.agents.k8s_cleanup._kubectl_async",
+        _async_fake(rc=1, out="", err="forbidden: User cannot list pods"),
     )
 
     from app.agents.k8s_cleanup import cleanup_research_resources
@@ -224,12 +236,17 @@ async def test_safety_net_only_touches_pending(monkeypatch):
         await session.commit()
 
     touched = []
-    def fake_kubectl(*a, **kw):
-        # _kubectl signature: _kubectl(kc_path, "delete", KIND, NAME, "-n", NS, ...)
-        # a[0] is kc_path (not in *args); a[1]='delete', a[2]=KIND, a[3]=NAME
-        touched.append((a[2], a[3]))  # (kind, name)
+    async def fake_kubectl_async(*a, **kw):
+        # _kubectl_async signature: _kubectl_async(args, *, timeout, env)
+        # args[0] is the args list; args[0][0]='--kubeconfig',
+        # args[0][1]=kc_path, args[0][2]='delete', args[0][3]=KIND, args[0][4]=NAME
+        touched.append((a[0][3], a[0][4]))  # (kind, name)
         return 0, "", ""
-    monkeypatch.setattr("app.agents.k8s_cleanup._kubectl", fake_kubectl)
+    # NB: monkeypatch must target the import *location*, not the
+    # source module. k8s_cleanup did `from app.agents.k8s import
+    # _kubectl_async` at module top, so the local binding is what
+    # matters inside the cleanup_research_resources function.
+    monkeypatch.setattr("app.agents.k8s_cleanup._kubectl_async", fake_kubectl_async)
 
     from app.agents.k8s_cleanup import safety_net_cleanup
     n = await safety_net_cleanup("/tmp/fake.kubeconfig", rid)
