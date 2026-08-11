@@ -95,6 +95,26 @@ async def _load_kubeconfig() -> tuple[str, dict]:
     token = decrypt(cluster.bearer_token_enc) if cluster.bearer_token_enc else ""
     ca = decrypt(cluster.ca_cert_enc) if cluster.ca_cert_enc else ""
 
+    # Resilience: if the DB cluster's encrypted token fails to decrypt
+    # (most often because AIRW_ENCRYPTION_KEY was rotated and the stored
+    # ciphertexts were encrypted with the previous key), fall back to
+    # the file-based kubeconfig rather than emit empty tokens that
+    # the API server rejects with "error: EOF".
+    if not token and os.path.exists(FALLBACK_KUBECONFIG_PATH):
+        logger.warning(
+            "DB cluster %r has no usable token (Fernet decrypt likely failed); "
+            "falling back to file kubeconfig at %s",
+            cluster.name, FALLBACK_KUBECONFIG_PATH,
+        )
+        with open(FALLBACK_KUBECONFIG_PATH) as f:
+            config = yaml.safe_load(f)
+        meta = {
+            "name": config.get("clusters", [{}])[0].get("name", "fallback"),
+            "source": "file (db token decrypt failed)",
+            "namespace": cluster.default_namespace,
+        }
+        return FALLBACK_KUBECONFIG_PATH, meta
+
     config = {
         "apiVersion": "v1",
         "kind": "Config",
@@ -102,8 +122,13 @@ async def _load_kubeconfig() -> tuple[str, dict]:
             "name": cluster.name,
             "cluster": {
                 "server": cluster.api_server,
-                "insecure-skip-tls-verify": cluster.skip_tls_verify,
-                **({"certificate-authority-data": _b64.b64encode(ca.encode()).decode()} if ca else {}),
+                # kubectl refuses both certificate-authority-data AND
+                # insecure-skip-tls-verify: "specifying a root certificates
+                # file with the insecure flag is not allowed". When
+                # skip_tls_verify is set we MUST drop the CA.
+                **({"insecure-skip-tls-verify": True} if cluster.skip_tls_verify else {}),
+                **({"certificate-authority-data": _b64.b64encode(ca.encode()).decode()}
+                   if (ca and not cluster.skip_tls_verify) else {}),
             }
         }],
         "contexts": [{
