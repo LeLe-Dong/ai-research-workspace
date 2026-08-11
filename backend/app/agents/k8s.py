@@ -624,11 +624,11 @@ async def validate_with_k8s(
         logger.warning(f"k8s validation artifact persist failed: {e}")
 
     # 5. Cleanup — table-driven
-    # ADR-002 commit 4: instead of hardcoding `kubectl delete pod`, walk
-    # research_resources for this research_id. The Pod we just applied was
-    # recorded as a row inside the apply step (we'll add the record call
-    # below). The safety-net ensures the row gets deleted even if the
-    # caller's iteration was cut short.
+    # Walk research_resources for this research_id, kubectl delete each,
+    # mark deleted_at + cleanup_status='done' on success. The Pod we
+    # applied was recorded as a row in the apply step (part 2b); the
+    # safety-net_cleanup at the start of this function swept any
+    # orphaned rows from prior crashed runs.
     from app.agents.k8s_cleanup import cleanup_research_resources
     cleanup_result = await cleanup_research_resources(kc_path, research_id)
     summary = cleanup_result.get("summary", "cleanup finished")
@@ -639,7 +639,7 @@ async def validate_with_k8s(
         title="k8s 验证收尾完成",
         detail=f"{summary} · 集群 {node_name or '可访问'}" +
                (f" · {len(failed)} 个资源未清掉" if failed else ""),
-        task_id="task-validate", task_progress=100,
+        task_id="task-10", task_progress=100,
     )
 
     # Cleanup temp kubeconfig
