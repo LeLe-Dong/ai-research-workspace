@@ -209,6 +209,51 @@ def delete_namespace(kc_path: str, ns: str) -> tuple[int, str, str]:
     return proc.returncode, proc.stdout, proc.stderr
 
 
+async def _kubectl_async(
+    args: list[str],
+    *,
+    timeout: float = 15.0,
+    env: dict | None = None,
+) -> tuple[int, str, str]:
+    """Async version of _kubectl — non-blocking on the event loop.
+
+    Returns (rc, stdout, stderr). On any failure (binary missing,
+    timeout, exec error) returns (-1/-2, "", "<error>") so the caller
+    can treat it identically to a sync failure. Timeout cleanup
+    kills the subprocess so we don't leak kubectl processes.
+
+    The args list is the kubectl command (NOT including "kubectl"
+    itself, which is prepended here). Caller passes --kubeconfig
+    via env if KUBECONFIG is not already set in the environment.
+    """
+    cmd = ["kubectl", *args]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+    except FileNotFoundError:
+        return -1, "", "kubectl binary not found in PATH"
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout,
+        )
+        return (
+            proc.returncode,
+            stdout_b.decode("utf-8", errors="replace"),
+            stderr_b.decode("utf-8", errors="replace"),
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+        return -2, "", f"kubectl timed out after {timeout}s"
+
+
 async def validate_with_k8s(
     research_id: str,
     title: str,
@@ -520,13 +565,16 @@ async def validate_with_k8s(
     # TPS / latency / ops_per_sec.
     log_text = ""
     try:
-        log_proc = subprocess.run(
-            ["kubectl", "--kubeconfig", kc_path, "logs",
+        rc, out, _err = await _kubectl_async(
+            ["--kubeconfig", kc_path, "logs",
              test_pod_name, "-n", ns, "--tail=200"],
-            capture_output=True, text=True, timeout=10,
+            timeout=10,
+            env=poll_env,
         )
-        if log_proc.returncode == 0:
-            log_text = log_proc.stdout or ""
+        if rc == 0:
+            log_text = out or ""
+        elif rc not in (-1, -2):
+            logger.warning(f"kubectl logs failed (rc={rc}): {_err[:200]}")
     except Exception as e:
         logger.warning(f"kubectl logs failed: {e}")
 
@@ -538,13 +586,14 @@ async def validate_with_k8s(
     # be deployed — that's fine, log absence.
     resource_metrics: dict = {}
     try:
-        top_proc = subprocess.run(
-            ["kubectl", "--kubeconfig", kc_path, "top", "pod",
+        top_rc, top_out, _top_err = await _kubectl_async(
+            ["--kubeconfig", kc_path, "top", "pod",
              test_pod_name, "-n", ns, "--no-headers"],
-            capture_output=True, text=True, timeout=5,
+            timeout=5,
+            env=poll_env,
         )
-        if top_proc.returncode == 0 and top_proc.stdout.strip():
-            parts = top_proc.stdout.strip().split()
+        if top_rc == 0 and top_out.strip():
+            parts = top_out.strip().split()
             if len(parts) >= 3:
                 resource_metrics = {
                     "source": "metrics-server (实时)",
@@ -554,49 +603,46 @@ async def validate_with_k8s(
     except Exception:
         pass
     if "cpu_usage" not in resource_metrics:
-        try:
-            desc_proc = subprocess.run(
-                ["kubectl", "--kubeconfig", kc_path, "describe", "pod",
-                 test_pod_name, "-n", ns],
-                capture_output=True, text=True, timeout=5,
-            )
-            if desc_proc.returncode == 0:
-                desc_text = desc_proc.stdout
-                cpu_lim = mem_lim = cpu_req = mem_req = None
-                in_box = ""
-                for line in desc_text.splitlines():
-                    s = line.strip()
-                    if s.startswith("Limits:"):
-                        in_box = "lim"
-                    elif s.startswith("Requests:"):
-                        in_box = "req"
-                    elif in_box == "lim":
-                        if "cpu:" in s:
-                            cpu_lim = s.split("cpu:", 1)[1].strip()
-                        if "memory:" in s:
-                            mem_lim = s.split("memory:", 1)[1].strip()
-                        if cpu_lim is not None and mem_lim is not None:
-                            in_box = ""
-                    elif in_box == "req":
-                        if "cpu:" in s:
-                            cpu_req = s.split("cpu:", 1)[1].strip()
-                        if "memory:" in s:
-                            mem_req = s.split("memory:", 1)[1].strip()
-                        if cpu_req is not None and mem_req is not None:
-                            in_box = ""
-                if any([cpu_lim, mem_lim, cpu_req, mem_req]):
-                    resource_metrics = {
-                        "source": "kubectl describe (配置值)",
-                        "cpu_limit": cpu_lim or "?",
-                        "memory_limit": mem_lim or "?",
-                        "cpu_request": cpu_req or "?",
-                        "memory_request": mem_req or "?",
-                        "_note": (
-                            "实际使用量需 metrics-server 部署后通过 kubectl top 获取"
-                        ),
-                    }
-        except Exception:
-            pass
+        desc_rc, desc_text, _desc_err = await _kubectl_async(
+            ["--kubeconfig", kc_path, "describe", "pod",
+             test_pod_name, "-n", ns],
+            timeout=5,
+            env=poll_env,
+        )
+        if desc_rc == 0 and desc_text:
+            cpu_lim = mem_lim = cpu_req = mem_req = None
+            in_box = ""
+            for line in desc_text.splitlines():
+                s = line.strip()
+                if s.startswith("Limits:"):
+                    in_box = "lim"
+                elif s.startswith("Requests:"):
+                    in_box = "req"
+                elif in_box == "lim":
+                    if "cpu:" in s:
+                        cpu_lim = s.split("cpu:", 1)[1].strip()
+                    if "memory:" in s:
+                        mem_lim = s.split("memory:", 1)[1].strip()
+                    if cpu_lim is not None and mem_lim is not None:
+                        in_box = ""
+                elif in_box == "req":
+                    if "cpu:" in s:
+                        cpu_req = s.split("cpu:", 1)[1].strip()
+                    if "memory:" in s:
+                        mem_req = s.split("memory:", 1)[1].strip()
+                    if cpu_req is not None and mem_req is not None:
+                        in_box = ""
+            if any([cpu_lim, mem_lim, cpu_req, mem_req]):
+                resource_metrics = {
+                    "source": "kubectl describe (配置值)",
+                    "cpu_limit": cpu_lim or "?",
+                    "memory_limit": mem_lim or "?",
+                    "cpu_request": cpu_req or "?",
+                    "memory_request": mem_req or "?",
+                    "_note": (
+                        "实际使用量需 metrics-server 部署后通过 kubectl top 获取"
+                    ),
+                }
 
     # Compose the validation result and persist as a k8s-validation
     # artifact so the report writer can quote the empirical numbers.
