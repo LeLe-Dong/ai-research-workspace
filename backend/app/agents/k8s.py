@@ -364,30 +364,43 @@ async def validate_with_k8s(
     poll_env = {**os.environ, "KUBECONFIG": kc_path}
     poll_pod_name = test_pod_name  # airw-bench-<short>, set in apply step
     poll_tick = 0
-    # Best-effort kubectl wait --for=condition=...=Running
-    try:
-        wait_proc = await asyncio.create_subprocess_exec(
-            "kubectl", "--kubeconfig", kc_path,
-            "wait", f"--namespace={ns}",
-            f"--for=jsonpath={{.status.phase}}=Running",
-            f"--timeout={min(workload.timeout_sec, 90)}s",
-            f"pod/{poll_pod_name}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=poll_env,
-        )
+    # Race fix: spawn kubectl wait as a background task so the
+    # manual poll can break out as soon as wait confirms Running.
+    # Without this fix, kubectl wait would block the await for up
+    # to workload.timeout_sec, then the manual poll would loop
+    # for ANOTHER full workload.timeout_sec producing redundant
+    # "pod poll t=Ns: Running" events. The fix:
+    #   1. Spawn the wait as a Task. We never yield its events
+    #      inline — instead, the poll loop checks wait_task state.
+    #   2. In the poll loop, after each tick where the pod is
+    #      already Running/Succeeded/Failed, check if wait finished
+    #      with rc=0. If yes, emit ONE "kubectl wait succeeded"
+    #      event and break out.
+    #   3. At the end, clean up the wait task (cancel if still
+    #      running). Without this, the subprocess leaks.
+
+    async def _run_kubectl_wait() -> int:
+        """Returns the subprocess returncode; -1 if exec failed."""
         try:
-            wout, werr = await asyncio.wait_for(
+            wait_proc = await asyncio.create_subprocess_exec(
+                "kubectl", "--kubeconfig", kc_path,
+                "wait", f"--namespace={ns}",
+                f"--for=jsonpath={{.status.phase}}=Running",
+                f"--timeout={min(workload.timeout_sec, 90)}s",
+                f"pod/{poll_pod_name}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=poll_env,
+            )
+        except Exception as e:
+            logger.warning("kubectl wait spawn failed: %s", e)
+            return -1
+        try:
+            await asyncio.wait_for(
                 wait_proc.communicate(),
                 timeout=workload.timeout_sec + 5,
             )
-            if wait_proc.returncode == 0:
-                yield AgentEvent(
-                    phase="validate", level="info",
-                    title="pod 已 Running（kubectl wait 通过）",
-                    detail=f"等待 {int(time.time() - start)}s",
-                    task_id="task-10", task_progress=75,
-                )
+            return wait_proc.returncode
         except asyncio.TimeoutError:
             wait_proc.kill()
             try:
@@ -398,56 +411,87 @@ async def validate_with_k8s(
                 "kubectl wait timed out for pod %s after %ds",
                 poll_pod_name, workload.timeout_sec + 5,
             )
-    except Exception as e:
-        logger.warning("kubectl wait failed for pod %s: %s", poll_pod_name, e)
+            return -2
 
-    # Manual poll loop: status check + per-tick progress event.
-    # Stays bounded by workload.timeout_sec so a slow cluster can't
-    # pin us here forever.
-    while time.time() - start < workload.timeout_sec:
-        await asyncio.sleep(3)
-        poll_tick += 1
-        elapsed = int(time.time() - start)
-        poll_error = None
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "kubectl", "get", "pod", poll_pod_name,
-                "-n", ns, "-o", "json",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=poll_env,
-            )
+    wait_task = asyncio.create_task(_run_kubectl_wait())
+    wait_succeeded = False
+
+    try:
+        # Manual poll loop: status check + per-tick progress event.
+        # Stays bounded by workload.timeout_sec so a slow cluster
+        # can't pin us here forever.
+        while time.time() - start < workload.timeout_sec:
+            await asyncio.sleep(3)
+            poll_tick += 1
+            elapsed = int(time.time() - start)
+            poll_error = None
             try:
-                out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=5)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                poll_error = "kubectl get pod timed out"
+                proc = await asyncio.create_subprocess_exec(
+                    "kubectl", "get", "pod", poll_pod_name,
+                    "-n", ns, "-o", "json",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=poll_env,
+                )
+                try:
+                    out_b, err_b = await asyncio.wait_for(
+                        proc.communicate(), timeout=5,
+                    )
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    poll_error = "kubectl get pod timed out"
+                    continue
+                if proc.returncode != 0:
+                    poll_error = (
+                        f"kubectl rc={proc.returncode}: "
+                        f"{(err_b or b'').decode()[:200]}"
+                    )
+                    continue
+                data = json.loads(out_b.decode("utf-8", errors="replace"))
+            except (RuntimeError, json.JSONDecodeError, Exception) as e:
+                poll_error = str(e)
                 continue
-            if proc.returncode != 0:
-                poll_error = f"kubectl rc={proc.returncode}: {(err_b or b'').decode()[:200]}"
-                continue
-            data = json.loads(out_b.decode("utf-8", errors="replace"))
-        except (RuntimeError, json.JSONDecodeError, Exception) as e:
-            poll_error = str(e)
-            continue
-        status = data.get("status", {})
-        final_status = status.get("phase", "Unknown")
-        pod_ip = status.get("podIP", "")
-        spec = data.get("spec", {})
-        node_name = spec.get("nodeName", "")
-        conditions = [c.get("type", "") + "=" + c.get("status", "")
-                       for c in status.get("conditions", [])]
-        yield AgentEvent(
-            phase="validate", level="info",
-            title=f"pod poll t={elapsed}s (#{poll_tick}): {final_status}",
-            detail=f"node={node_name or '(未调度)'} ip={pod_ip or '-'} ready=" +
-                   ",".join(c for c in conditions if c.startswith("Ready=")) or "-",
-            task_id="task-10",
-            task_progress=min(85, 60 + poll_tick * 1),
-        )
-        if final_status in ("Running", "Succeeded", "Failed"):
-            break
+            status = data.get("status", {})
+            final_status = status.get("phase", "Unknown")
+            pod_ip = status.get("podIP", "")
+            spec = data.get("spec", {})
+            node_name = spec.get("nodeName", "")
+            conditions = [c.get("type", "") + "=" + c.get("status", "")
+                           for c in status.get("conditions", [])]
+            yield AgentEvent(
+                phase="validate", level="info",
+                title=f"pod poll t={elapsed}s (#{poll_tick}): {final_status}",
+                detail=f"node={node_name or '(未调度)'} ip={pod_ip or '-'} ready=" +
+                       ",".join(c for c in conditions if c.startswith("Ready=")) or "-",
+                task_id="task-10",
+                task_progress=min(85, 60 + poll_tick * 1),
+            )
+            if final_status in ("Running", "Succeeded", "Failed"):
+                # Race fix: check if kubectl wait already succeeded.
+                # If yes, emit the success event and break out
+                # immediately instead of waiting for the next tick.
+                if wait_task.done() and not wait_succeeded:
+                    rc = wait_task.result()
+                    if rc == 0:
+                        wait_succeeded = True
+                        yield AgentEvent(
+                            phase="validate", level="info",
+                            title="pod 已 Running（kubectl wait 通过）",
+                            detail=f"等待 {int(time.time() - start)}s",
+                            task_id="task-10", task_progress=75,
+                        )
+                break
+    finally:
+        # Clean up the wait task: cancel if still running, then
+        # await so the asyncio task object is GC'd. Without this
+        # the kubectl wait subprocess can leak if we exit early.
+        if not wait_task.done():
+            wait_task.cancel()
+            try:
+                await wait_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     # 4. Capture results + run benchmark, parse metrics, write artifact.
     not_scheduled = not bool(node_name)
