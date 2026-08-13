@@ -413,6 +413,7 @@ async def validate_with_k8s(
     poll_env = {**os.environ, "KUBECONFIG": kc_path}
     poll_pod_name = test_pod_name  # airw-bench-<short>, set in apply step
     poll_tick = 0
+    last_log_line_count: int = 0  # de-dup live benchmark log pushes
     # Spawn kubectl wait as a background task targeting the TERMINAL phase
     # (Succeeded/Failed). The manual poll loop monitors its state and emits
     # progress events; once the pod reaches a terminal phase we break out
@@ -509,6 +510,39 @@ async def validate_with_k8s(
                 task_id="task-10",
                 task_progress=min(85, 60 + poll_tick * 1),
             )
+
+            # Live stream the benchmark container's stdout to the console.
+            # Once the pod is Running we can read its logs; we grab them
+            # each tick so pgbench/redis-benchmark progress lines
+            # (tps/latency CSV) appear in the UI in near-real-time instead
+            # of only appearing in the final artifact. Best-effort: any
+            # failure just skips this tick.
+            if final_status in ("Running", "Succeeded", "Failed"):
+                try:
+                    lrc, lout, _lerr = await _kubectl_async(
+                        ["--kubeconfig", kc_path, "logs",
+                         poll_pod_name, "-n", ns],
+                        timeout=8,
+                        env=poll_env,
+                    )
+                    if lrc == 0 and lout:
+                        # Diff by line index so we only push NEW lines.
+                        # `kubectl logs` (no --tail) returns the full log;
+                        # we track how many lines we've already emitted and
+                        # forward only the trailing new ones. This avoids
+                        # re-emitting old lines when the --tail window slides.
+                        all_lines = lout.splitlines()
+                        if len(all_lines) > last_log_line_count:
+                            new_lines = all_lines[last_log_line_count:]
+                            last_log_line_count = len(all_lines)
+                            yield AgentEvent(
+                                phase="validate", level="log",
+                                title=f"benchmark 输出 (t={elapsed}s)",
+                                detail="\n".join(new_lines)[-2000:],
+                                task_id="task-10",
+                            )
+                except Exception:
+                    pass
             if final_status in TERMINAL_PHASES:
                 # Check if kubectl wait already confirmed the terminal phase.
                 if wait_task.done() and not wait_succeeded:

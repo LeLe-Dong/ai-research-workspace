@@ -255,28 +255,31 @@ WORKLOADS: dict[str, Workload] = {
 # Order matters: more specific patterns first.
 
 WORKLOAD_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
+    # Most specific / highest-signal first. "redis", "mysql", "mongo",
+    # "nginx" are unambiguous and should beat generic database words that
+    # often appear in an LLM report for a non-database topic.
+    ("cache", (
+        "redis", "memcached", "key-value", "kv store", "kv 缓存", "缓存", "cache",
+    )),
     ("mysql", (
-        "mysql", "mysql 部署", "mysql 集群", "mysql 优化", "mysqlslap",
+        "mysql", "mysqlslap",
     )),
     ("mongo", (
-        "mongodb", "mongo", "mongosh", "文档数据库", "document store",
+        "mongodb", "mongosh", "文档数据库", "document store",
     )),
-    ("database", (
-        "postgres", "postgresql", "mariadb", "tidb",
-        "数据库", "oltp", "olap", "sql", "transaction", "事务", "database",
-        "oracle", "oceanbase", "polardb", "goldendb", "dameng",
-    )),
-    ("cache", (
-        "redis", "memcached", "kv ", "缓存", "cache", "key-value",
+    ("web", (
+        "nginx", "ingress", "envoy", "traefik", "haproxy",
+        "service mesh", "服务网格", "网关", "api 网关",
     )),
     ("ai", (
         "llm", "推理", "inference", "大模型", "embedding", "向量",
         "vector", "vllm", "ollama", "gpt", "transformer", "ai ",
         "rag ", "stable diffusion", "whisper",
     )),
-    ("web", (
-        "nginx", "http", "api ", "web ", "网关", "ingress", "envoy",
-        "traefik", "haproxy", "service mesh", "服务网格",
+    ("database", (
+        "postgres", "postgresql", "mariadb", "tidb",
+        "数据库", "oltp", "olap", "sql", "transaction", "事务", "database",
+        "oracle", "oceanbase", "polardb", "goldendb", "dameng",
     )),
 ]
 

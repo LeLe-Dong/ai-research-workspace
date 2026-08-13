@@ -18,6 +18,21 @@ from typing import AsyncIterator
 from app.agents.base import AgentClient, AgentEvent, ResearchRequest
 from app.agents.llm import StepfunClient, LLMError, _strip_thinking
 from app.agents.search import DDGSSearch, WebSearcher, MiniMaxSearch
+from app.services.decision import should_run_k8s_validation
+
+
+def _req_as_research(req: ResearchRequest):
+    """Duck-typed adapter so the decision helper can read fields off the
+    ResearchRequest dataclass without a DB roundtrip."""
+    class _R:
+        pass
+    r = _R()
+    r.title = req.title
+    r.goal = req.goal
+    r.constraints = req.constraints
+    r.depth = req.depth
+    r.requires_k8s_validation = req.requires_k8s_validation
+    return r
 from app.agents.prompts import (
     UNDERSTAND_SYSTEM, UNDERSTAND_USER_TEMPLATE,
     RESEARCH_SYSTEM, RESEARCH_USER_TEMPLATE,
@@ -178,7 +193,8 @@ class StepfunAgentClient(AgentClient):
         try:
             # Phase 1: UNDERSTAND
             yield AgentEvent(phase="understand", level="info",
-                             title="理解研究目标", detail="通过 LLM 拆解")
+                             title="理解研究目标", detail="通过 LLM 拆解",
+                             task_id="task-00")
             yield AgentEvent(phase="understand", level="info",
                              title="拆解为子问题",
                              detail="让 LLM 将目标拆为原子问题",
@@ -219,17 +235,20 @@ class StepfunAgentClient(AgentClient):
             hits = self.searcher.search_many(search_queries)
             yield AgentEvent(phase="search", level="info",
                              title=f"找到 {len(hits)} 个资料源",
-                             detail="按 URL 去重")
+                             detail="按 URL 去重",
+                             task_id="task-01")
 
 
             # Also search for images
             yield AgentEvent(phase="search", level="info",
                              title="图片检索中",
-                             detail=", ".join(search_queries[:3])[:100])
+                             detail=", ".join(search_queries[:3])[:100],
+                             task_id="task-01")
             image_hits = self.searcher.search_images_many(search_queries[:3], max_per_query=2)
             yield AgentEvent(phase="search", level="success",
                              title=f"找到 {len(image_hits)} 张图片",
-                             detail="DDGS 图片搜索")
+                             detail="DDGS 图片搜索",
+                             task_id="task-01")
             # Format images as markdown
             if image_hits:
                 image_md = "\n\n".join(
@@ -240,7 +259,8 @@ class StepfunAgentClient(AgentClient):
             for i, (q, h) in enumerate(hits[:5]):
                 yield AgentEvent(phase="read", level="info",
                                  title=f"阅读资料 {i + 1}/{min(len(hits), 5)}",
-                                 detail=f"{h.title[:60]} — {h.url[:60]}")
+                                 detail=f"{h.title[:60]} — {h.url[:60]}",
+                                 task_id="task-03")
 
             yield AgentEvent(phase="read", level="info",
                              title="综合研究结论",
@@ -408,36 +428,77 @@ class StepfunAgentClient(AgentClient):
                              title="最终报告完成",
                              detail="", task_id="task-08", task_progress=100)
 
-            # Phase 4.5: K8s ENVIRONMENT VALIDATION (optional, only if report has k8s topics)
+            # Phase 4.5: K8s ENVIRONMENT VALIDATION (optional, multi-signal decision)
             yield AgentEvent(phase="validate", level="info",
                              title="环境验证",
                              detail="检查报告是否涉及 k8s 集群操作",
-                             task_id="task-09", task_progress=0)
+                             task_id="task-10", task_progress=0)
             try:
                 from app.agents.k8s import validate_with_k8s
-                # Only run if report contains k8s keywords (heuristic)
-                k8s_keywords = ("kubernetes", "k8s", "pod", "deployment", "容器", "cluster", "节点", "deploy", "集群")
-                if any(kw in report_md.lower() for kw in k8s_keywords):
-                    async for ev in validate_with_k8s(
-                        research_id=req.research_id,
-                        title=req.title,
-                        goal=req.goal,
-                        recommendations_md=report_md,
-                    ):
-                        # Preserve original task_id for UI DAG
-                        ev.task_id = "task-09"
-                        yield ev
+                from app.agents.k8s_experiment import run_experiment
+                from app.services.decision import should_run_k8s_validation
+                decision = should_run_k8s_validation(_req_as_research(req), report_md)
+                yield AgentEvent(
+                    phase="validate", level="info",
+                    title=f"环境验证 决策: {'执行' if decision.should_run else '跳过'}",
+                    detail=f"判定: {decision.reason}",
+                    task_id="task-10", task_progress=2,
+                )
+                if decision.should_run:
+                    # Prefer the LLM-driven experiment: it designs the
+                    # deployment manifest + assertions for THIS research's
+                    # recommendation (hermes k8s-expert locally, Stepfun
+                    # fallback). Falls back to the fixed workload template
+                    # only if the experiment path raises an unexpected error.
+                    ran_experiment = False
+                    try:
+                        async for ev in run_experiment(
+                            research_id=req.research_id,
+                            goal=req.goal,
+                            recommendations_md=report_md,
+                            title=req.title,
+                        ):
+                            # Preserve original task_id for UI DAG
+                            ev.task_id = "task-10"
+                            yield ev
+                        ran_experiment = True
+                    except Exception as e:
+                        logger.warning(
+                            "LLM experiment failed (%s), falling back to fixed workload template", e
+                        )
+                        yield AgentEvent(
+                            phase="validate", level="warn",
+                            title="AI 试验回退到固定模板",
+                            detail=f"{type(e).__name__}: {str(e)[:150]}",
+                            task_id="task-10",
+                        )
+                    if not ran_experiment:
+                        async for ev in validate_with_k8s(
+                            research_id=req.research_id,
+                            title=req.title,
+                            goal=req.goal,
+                            recommendations_md=report_md,
+                        ):
+                            ev.task_id = "task-10"
+                            yield ev
                 else:
                     yield AgentEvent(phase="validate", level="info",
                                      title="环境验证已跳过",
-                                     detail="报告不涉及 k8s 集群操作",
-                                     task_id="task-09", task_progress=100)
+                                     detail=f"无需集群验证 · {decision.reason}",
+                                     task_id="task-10", task_progress=100)
             except Exception as e:
                 logger.warning("k8s validation phase failed: %s", e)
                 yield AgentEvent(phase="validate", level="warn",
                                  title="环境验证未执行",
                                  detail=f"{type(e).__name__}: {str(e)[:120]}",
-                                 task_id="task-09", task_progress=100)
+                                 task_id="task-10", task_progress=100)
+
+            # Append empirical k8s validation results to the report BEFORE
+            # the reviewer runs and the report artifact is emitted, so both
+            # cite the real measured numbers. Best-effort: unchanged on any
+            # failure.
+            from app.agents.k8s_experiment import append_empirical_section
+            report_md = append_empirical_section(report_md, req.research_id)
 
             # Phase 5: REVIEWER
             yield AgentEvent(phase="review", level="info",
