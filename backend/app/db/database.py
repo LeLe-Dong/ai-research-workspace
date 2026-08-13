@@ -71,6 +71,59 @@ async def init_db() -> None:
             if col not in review_col_names:
                 await conn.execute(text(f"ALTER TABLE reviews ADD COLUMN {col} TEXT DEFAULT ''"))
 
+        # Add task_id column to timeline_events for task-scoped console filtering.
+        # Nullable: most events (LLM traces, mock per-phase, hermes stdout) are
+        # legitimately task-less. Migrations use PRAGMA + ALTER (no alembic).
+        te_cols = await conn.execute(text("PRAGMA table_info(timeline_events)"))
+        te_col_names = {c[1] for c in te_cols.all()}
+        if 'task_id' not in te_col_names:
+            await conn.execute(text(
+                "ALTER TABLE timeline_events ADD COLUMN task_id TEXT"
+            ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_timeline_events_task_id ON timeline_events(task_id)"
+        ))
+
+        # Smart K8s validation trigger (3-state: auto/on/off)
+        r_cols = await conn.execute(text("PRAGMA table_info(researches)"))
+        r_col_names = {c[1] for c in r_cols.all()}
+        if 'requires_k8s_validation' not in r_col_names:
+            await conn.execute(text(
+                "ALTER TABLE researches ADD COLUMN requires_k8s_validation INTEGER DEFAULT 0"
+            ))
+
+        # use_custom_style (Phase A): when 1, hermes_researcher injects the
+        # user's active KnowledgeStyle into the research prompt instead of
+        # the default 14-dimension framework.
+        if 'use_custom_style' not in r_col_names:
+            await conn.execute(text(
+                "ALTER TABLE researches ADD COLUMN use_custom_style INTEGER DEFAULT 0"
+            ))
+
+        # style_id (Phase B): per-research style binding. NULL means "use the
+        # currently active style". A non-null value binds this research to a
+        # specific KnowledgeStyle, enabling different research tasks to use
+        # different user-defined styles (e.g. DB-style vs security-style).
+        if 'style_id' not in r_col_names:
+            await conn.execute(text(
+                "ALTER TABLE researches ADD COLUMN style_id VARCHAR(12)"
+            ))
+
+        # Research topics (iterative baseline): researches.topic_id FK +
+        # iteration counter. The research_topics table itself is created by
+        # create_all (new table); only the column additions need migration.
+        if 'topic_id' not in r_col_names:
+            await conn.execute(text(
+                "ALTER TABLE researches ADD COLUMN topic_id VARCHAR(12)"
+            ))
+        if 'iteration' not in r_col_names:
+            await conn.execute(text(
+                "ALTER TABLE researches ADD COLUMN iteration INTEGER DEFAULT 1"
+            ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_researches_topic_id ON researches(topic_id)"
+        ))
+
 
 @asynccontextmanager
 async def get_session() -> AsyncIterator[AsyncSession]:

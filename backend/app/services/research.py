@@ -7,6 +7,17 @@ from app.schemas.research import ResearchCreate
 
 
 async def create_research(session: AsyncSession, data: ResearchCreate) -> Research:
+    # If attaching to a topic, compute the next iteration number.
+    topic_id = getattr(data, "topic_id", None) or None
+    iteration = 1
+    if topic_id:
+        from sqlalchemy import func
+        max_it = await session.execute(
+            select(func.max(Research.iteration)).where(Research.topic_id == topic_id)
+        )
+        current_max = max_it.scalar()
+        iteration = (current_max or 0) + 1
+
     r = Research(
         title=data.title,
         goal=data.goal,
@@ -15,6 +26,14 @@ async def create_research(session: AsyncSession, data: ResearchCreate) -> Resear
         depth=data.depth,
         priority=data.priority,
         estimated_cost=data.estimated_cost,
+        # Smart K8s validation trigger: -1=force off, 0=auto, 1=force on
+        requires_k8s_validation=data.requires_k8s_validation,
+        # Personalized research style (Phase A/B): when 1, the agent injects
+        # the user's active (or specifically bound) KnowledgeStyle.
+        use_custom_style=data.use_custom_style,
+        style_id=data.style_id,
+        topic_id=topic_id,
+        iteration=iteration,
         status="pending",
     )
     session.add(r)

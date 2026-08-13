@@ -6,7 +6,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   LayoutDashboard, FlaskConical, BookOpen, History, Settings,
-  Sparkles, ChevronDown,
+  Sparkles, ChevronDown, Layers,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
@@ -17,7 +17,12 @@ export function Sidebar() {
   const { data: dashData } = useQuery({
     queryKey: ["dashboard"],
     queryFn: () => api.get<{ stats: { running: number; kb_count?: number } }>("/api/v1/dashboard"),
-    refetchInterval: 5_000,
+    // Sidebar lives in the root layout, so it only mounts once per session.
+    // A long staleTime avoids refetching on every route change in the same
+    // session. The dashboard page (also reading the same query key) will
+    // surface fresh data when the user actually opens it.
+    staleTime: 60_000,
+    gcTime: 5 * 60_000,
   });
   const runningCount = dashData?.stats.running ?? 0;
   const kbCount = dashData?.stats.kb_count ?? 0;
@@ -39,6 +44,7 @@ export function Sidebar() {
       badgeClass: kbCount > 0 ? "bg-muted text-foreground" : undefined,
     },
     { href: "/history", label: "历史", icon: History },
+    { href: "/topics", label: "研究基线", icon: Layers },
     { href: "/settings", label: "设置", icon: Settings },
   ];
   return (

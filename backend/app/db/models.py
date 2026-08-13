@@ -22,8 +22,26 @@ class Research(Base):
     depth: Mapped[str] = mapped_column(String(20), default="standard")  # quick / standard / deep
     priority: Mapped[str] = mapped_column(String(20), default="medium")  # low / medium / high
     estimated_cost: Mapped[float] = mapped_column(Float, default=0.0)
+    # Smart K8s validation trigger:
+    #   0  = auto (multi-signal decision: goal/title/output + depth)
+    #   1  = force on (user explicitly wants k8s pod validation)
+    #  -1  = force off (user explicitly opted out)
+    requires_k8s_validation: Mapped[int] = mapped_column(Integer, default=0)
+    # When 1, the agent injects a KnowledgeStyle into the research prompt.
+    # `style_id` (nullable) names the SPECIFIC style to use. When null,
+    # the active style is used as fallback. Different research tasks can
+    # bind to different styles (e.g. "数据库" vs "安全" vs "架构").
+    use_custom_style: Mapped[int] = mapped_column(Integer, default=0)
+    style_id: Mapped[str | None] = mapped_column(String(12), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)  # Set when status='failed'
     status: Mapped[str] = mapped_column(String(30), default="pending")  # pending / running / completed / failed
+
+    # Topic aggregation: a research belongs to a "research topic" so the same
+    # subject can be studied multiple times (iterations) with the user
+    # reviewing + adjusting the research boundary each round. Nullable for
+    # standalone researches.
+    topic_id: Mapped[str | None] = mapped_column(String(12), ForeignKey("research_topics.id"), nullable=True, index=True)
+    iteration: Mapped[int] = mapped_column(Integer, default=1)  # 1-based round within its topic
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -35,6 +53,7 @@ class Research(Base):
     # Version control
     versions: Mapped[list["ResearchVersion"]] = relationship("ResearchVersion", order_by="ResearchVersion.version", back_populates="research")
     reviews: Mapped[list["Review"]] = relationship("Review", back_populates="research", cascade="all, delete-orphan", lazy="selectin")
+    topic: Mapped["ResearchTopic | None"] = relationship("ResearchTopic", back_populates="researches")
 
 
 class Task(Base):
@@ -68,6 +87,14 @@ class TimelineEvent(Base):
     title: Mapped[str] = mapped_column(String(200))
     detail: Mapped[str] = mapped_column(Text, default="")
     sequence: Mapped[int] = mapped_column(Integer, default=0)
+    # Optional FK to Task. Nullable because:
+    # - Mock-agent per-phase events (TIMELINE_PHASES) don't carry task context
+    # - All stepfun _llm_event traces are task-less
+    # - All hermes _on_log lines are task-less
+    # Final artifact / review events are also task-less by design.
+    task_id: Mapped[str | None] = mapped_column(
+        String(12), ForeignKey("tasks.id"), nullable=True, index=True
+    )
 
 
 class Artifact(Base):
@@ -240,3 +267,72 @@ class ResearchResource(Base):
     )  # pending / running / done / failed
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class KnowledgeDocument(Base):
+    """User-uploaded pre-research document used for personalization.
+
+    Stores the original file path + parsed sections. Style extraction is
+    cached on a separate KnowledgeStyle row so we don't re-run the LLM
+    every time the user creates a new research.
+    """
+    __tablename__ = "knowledge_documents"
+
+    id: Mapped[str] = mapped_column(String(12), primary_key=True, default=gen_id)
+    filename: Mapped[str] = mapped_column(String(200))
+    storage_path: Mapped[str] = mapped_column(String(500))  # absolute path on disk
+    content: Mapped[str] = mapped_column(Text)  # full text
+    sections_json: Mapped[str] = mapped_column(Text, default="[]")  # JSON list of {heading, level, body}
+    byte_size: Mapped[int] = mapped_column(Integer, default=0)
+    uploaded_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class KnowledgeStyle(Base):
+    """LLM-extracted style profile from one or more uploaded documents.
+
+    `dimensions` is a JSON list of section names the user prefers (e.g.
+    ["产品/方案定位","技术架构","数据流与生命周期"]).
+    `tone`, `length_pref`, `quantification` capture qualitative preferences.
+    `source_doc_ids` links back to the documents this style was learned from.
+    `is_active` flags the currently-in-use style (singleton per user for v1).
+    """
+    __tablename__ = "knowledge_styles"
+
+    id: Mapped[str] = mapped_column(String(12), primary_key=True, default=gen_id)
+    name: Mapped[str] = mapped_column(String(200))
+    dimensions_json: Mapped[str] = mapped_column(Text, default="[]")  # ordered list of section names
+    tone: Mapped[str] = mapped_column(String(50), default="")  # "formal" / "casual" / "technical" / etc.
+    length_pref: Mapped[str] = mapped_column(String(50), default="medium")  # "concise" / "medium" / "extensive"
+    quantification: Mapped[str] = mapped_column(String(50), default="balanced")  # "narrative" / "balanced" / "metric-heavy"
+    custom_instructions: Mapped[str] = mapped_column(Text, default="")  # free-form LLM-extracted guidance
+    source_doc_ids: Mapped[str] = mapped_column(Text, default="[]")  # JSON list
+    is_active: Mapped[int] = mapped_column(Integer, default=0)  # 1 = currently used
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ResearchTopic(Base):
+    """Aggregates multiple research runs on the same subject.
+
+    A topic is the "baseline" container for iterative research: the user
+    studies a subject once, reviews the result, adjusts the research
+    boundary (goal / constraints / expected_output), and launches another
+    round. Each round is a separate Research row linked via topic_id, with
+    an incrementing `iteration` number.
+
+    Iteration history is preserved as the list of Research.iteration, so the
+    UI can render a timeline of boundary changes + conclusions.
+    """
+    __tablename__ = "research_topics"
+
+    id: Mapped[str] = mapped_column(String(12), primary_key=True, default=gen_id)
+    name: Mapped[str] = mapped_column(String(200))  # e.g. "Redis 集群高可用方案"
+    description: Mapped[str] = mapped_column(Text, default="")  # one-line subject summary
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Iterations of this topic (order by iteration number)
+    researches: Mapped[list["Research"]] = relationship(
+        "Research", back_populates="topic",
+        cascade="all, delete-orphan", order_by="Research.iteration",
+    )
