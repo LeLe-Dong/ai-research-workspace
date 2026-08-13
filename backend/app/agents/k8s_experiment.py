@@ -339,23 +339,64 @@ async def _resolve_pod_selector(kc_path: str, ns: str, target: str) -> str:
     return t
 
 
-async def _check_pod_ready(kc_path: str, ns: str, target: str, timeout_sec: int) -> dict:
-    """Wait until a pod matching target (selector or deployment/name) is Ready."""
+async def _check_pod_ready(kc_path: str, ns: str, target: str, timeout_sec: int,
+                           progress_cb=None) -> dict:
+    """Wait until a pod matching target (selector or deployment/name) is Ready.
+
+    progress_cb: optional async callable(msg: str) invoked on each poll tick
+    so the caller can stream the pod's live status to the console.
+    """
     selector = await _resolve_pod_selector(kc_path, ns, target)
     deadline = asyncio.get_event_loop().time() + timeout_sec
+    last_status = ""
+    last_wait_ts = 0.0
     while asyncio.get_event_loop().time() < deadline:
         rc, out, err = await _kubectl_async(
             ["--kubeconfig", kc_path, "get", "pod", "-n", ns,
-             "-l", selector, "-o", "jsonpath={.items[*].status.conditions[?(@.type==\"Ready\")].status}"],
+             "-l", selector,
+             "-o", "jsonpath={range .items[*]}{.metadata.name}{\" \"}{.status.phase}{\" \"}{.status.containerStatuses[*].state}{\"\\n\"}{end}"],
             timeout=10,
         )
-        if rc == 0 and out.strip() and "True" in out:
-            return {"passed": True, "evidence": f"pod ready ({target}): {out.strip()}"}
+        if rc == 0 and out.strip():
+            ready = "True" in out or 'running' in out.lower()
+            # Build a human-readable status line from the raw pod output.
+            status_line = ""
+            for line in out.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                name = parts[0]
+                phase = parts[1] if len(parts) > 1 else "?"
+                state = " ".join(parts[2:])
+                # state looks like {"running":{"startedAt":...}} or {"waiting":{"reason":"ContainerCreating"}}
+                reason = "running"
+                if "waiting" in state and "reason" in state:
+                    import re as _re
+                    m = _re.search(r"reason\\?\":\\?\"([^\\\"]+)", state)
+                    reason = m.group(1) if m else "waiting"
+                elif "terminated" in state and "reason" in state:
+                    m = _re.search(r"reason\\?\":\\?\"([^\\\"]+)", state)
+                    reason = m.group(1) if m else "terminated"
+                status_line += f"{name} [{phase}/{reason}] "
+            status_line = status_line.strip()
+            if ready:
+                return {"passed": True, "evidence": f"pod ready ({target}): {status_line}"}
+            if progress_cb is not None and status_line != last_status:
+                last_status = status_line
+                last_wait_ts = asyncio.get_event_loop().time()
+                await progress_cb(status_line)
+        # Throttle the "still waiting" hint so it doesn't spam the console.
+        now = asyncio.get_event_loop().time()
+        if progress_cb is not None and now - last_wait_ts >= 15:
+            last_wait_ts = now
+            await progress_cb(f"[pod_ready] 仍在等待就绪... ({int(deadline - now)}s 剩余)")
         await asyncio.sleep(3)
     return {"passed": False, "evidence": f"timeout after {timeout_sec}s waiting pod ready ({target})"}
 
 
-async def _check_service_ready(kc_path: str, ns: str, service: str, timeout_sec: int) -> dict:
+async def _check_service_ready(kc_path: str, ns: str, service: str, timeout_sec: int,
+                               progress_cb=None) -> dict:
     # Accept "service/name", a bare name, OR a label selector like
     # "app=redis-cache" (in which case resolve to the service's name).
     svc = service.strip()
@@ -372,6 +413,8 @@ async def _check_service_ready(kc_path: str, ns: str, service: str, timeout_sec:
             return {"passed": False, "evidence": f"no service matches selector '{service}'"}
     svc = svc.split("/")[-1]
     deadline = asyncio.get_event_loop().time() + timeout_sec
+    last_ips = ""
+    last_wait_ts = 0.0
     while asyncio.get_event_loop().time() < deadline:
         rc, out, err = await _kubectl_async(
             ["--kubeconfig", kc_path, "get", "endpoints", svc, "-n", ns,
@@ -379,15 +422,27 @@ async def _check_service_ready(kc_path: str, ns: str, service: str, timeout_sec:
             timeout=10,
         )
         if rc == 0 and out.strip():
-            return {"passed": True, "evidence": f"service {svc} has endpoints: {out.strip()}"}
+            ips = out.strip()
+            if ips != last_ips:
+                last_ips = ips
+                if progress_cb is not None:
+                    await progress_cb(f"[service_ready] {svc} endpoints: {ips}")
+            return {"passed": True, "evidence": f"service {svc} has endpoints: {ips}"}
+        now = asyncio.get_event_loop().time()
+        if progress_cb is not None and now - last_wait_ts >= 15:
+            last_wait_ts = now
+            await progress_cb(f"[service_ready] {svc} 暂无端点，等待... ({int(deadline - now)}s 剩余)")
         await asyncio.sleep(3)
     return {"passed": False, "evidence": f"timeout after {timeout_sec}s — service {svc} no endpoints"}
 
 
-async def _check_pod_log_match(kc_path: str, ns: str, target: str, substring: str, timeout_sec: int) -> dict:
+async def _check_pod_log_match(kc_path: str, ns: str, target: str, substring: str, timeout_sec: int,
+                               progress_cb=None) -> dict:
     selector = await _resolve_pod_selector(kc_path, ns, target)
     deadline = asyncio.get_event_loop().time() + timeout_sec
     seen = ""
+    last_seen = ""
+    last_wait_ts = 0.0
     while asyncio.get_event_loop().time() < deadline:
         rc, out, err = await _kubectl_async(
             ["--kubeconfig", kc_path, "logs", "-n", ns, "-l", selector, "--tail=200"],
@@ -396,6 +451,16 @@ async def _check_pod_log_match(kc_path: str, ns: str, target: str, substring: st
         if rc == 0 and substring in out:
             return {"passed": True, "evidence": f"log contains '{substring}'"}
         seen = out or ""
+        if progress_cb is not None:
+            tail = "\n".join(seen.splitlines()[-6:])
+            if tail and tail != last_seen:
+                last_seen = tail
+                await progress_cb(f"[pod_log_match] 日志尾部:\n{tail}")
+            elif not seen:
+                now = asyncio.get_event_loop().time()
+                if now - last_wait_ts >= 15:
+                    last_wait_ts = now
+                    await progress_cb(f"[pod_log_match] 暂无日志，等待 '{substring}' 出现...")
         await asyncio.sleep(3)
     return {"passed": False, "evidence": f"log never contained '{substring}'; tail: {seen[:200]}"}
 
@@ -492,29 +557,63 @@ async def run_experiment(
             rc, out, err = await _apply_workload(kc_path, w["yaml"])
             results["applied"].append({"name": w["name"], "kind": w["kind"], "image": w["image"],
                                        "rc": rc, "out": out.strip(), "err": err.strip()})
-            if rc != 0:
+            if rc == 0:
+                # Stream the manifest and kubectl's confirmation to the console
+                # so the user sees exactly what was deployed.
+                yield AgentEvent(phase="validate", level="log",
+                                 title=f"已应用 {w['kind']} {w['name']}",
+                                 detail=(out.strip() or "applied")[:400],
+                                 task_id="task-10")
+            else:
                 yield AgentEvent(phase="validate", level="error",
                                  title=f"应用 {w['name']} 失败", detail=err[:200],
                                  task_id="task-10")
 
-        # 4. Run checks
-        for c in plan["checks"]:
+        # 4. Run checks — each check runs as a background task that streams
+        #    live progress through a queue, so the console shows the pod's
+        #    state / endpoints / log tail in near-real-time while waiting.
+        for ci, c in enumerate(plan["checks"]):
             yield AgentEvent(phase="validate", level="info",
                              title=f"断言: {c['name']}",
                              detail=f"{c['type']} · {c['target']} · expect={c['expect']} · 超时 {c['timeout_sec']}s",
                              task_id="task-10",
-                             task_progress=min(80, 45 + plan["checks"].index(c) * 3))
-            res = None
-            if c["type"] == "pod_ready":
-                res = await _check_pod_ready(kc_path, ns, c["target"], c["timeout_sec"])
-            elif c["type"] == "service_ready":
-                res = await _check_service_ready(kc_path, ns, c["target"], c["timeout_sec"])
-            elif c["type"] == "pod_log_match":
-                res = await _check_pod_log_match(kc_path, ns, c["target"], c["expect"], c["timeout_sec"])
-            elif c["type"] == "http_ok":
-                res = await _check_http_ok(kc_path, ns, c["target"], c["expect"], c["timeout_sec"])
-            if res is None:
-                res = {"passed": False, "evidence": "unsupported check"}
+                             task_progress=min(80, 45 + ci * 3))
+
+            q: "asyncio.Queue[str]" = asyncio.Queue()
+
+            async def _progress(msg: str) -> None:
+                q.put_nowait(msg)
+
+            async def _run():
+                if c["type"] == "pod_ready":
+                    return await _check_pod_ready(kc_path, ns, c["target"], c["timeout_sec"], progress_cb=_progress)
+                elif c["type"] == "service_ready":
+                    return await _check_service_ready(kc_path, ns, c["target"], c["timeout_sec"], progress_cb=_progress)
+                elif c["type"] == "pod_log_match":
+                    return await _check_pod_log_match(kc_path, ns, c["target"], c["expect"], c["timeout_sec"], progress_cb=_progress)
+                elif c["type"] == "http_ok":
+                    return await _check_http_ok(kc_path, ns, c["target"], c["expect"], c["timeout_sec"])
+                return {"passed": False, "evidence": "unsupported check"}
+
+            task = asyncio.create_task(_run())
+            while not task.done():
+                try:
+                    msg = q.get_nowait()
+                    yield AgentEvent(phase="validate", level="log",
+                                     title=f"断言监控: {c['name']}",
+                                     detail=msg, task_id="task-10")
+                except asyncio.QueueEmpty:
+                    pass
+                # NOTE: do NOT use asyncio.wait_for(task, timeout) here — it
+                # would CANCEL the running check task on timeout. Just sleep
+                # and re-check task.done().
+                await asyncio.sleep(2)
+            res = task.result()
+            while not q.empty():
+                msg = q.get_nowait()
+                yield AgentEvent(phase="validate", level="log",
+                                 title=f"断言监控: {c['name']}",
+                                 detail=msg, task_id="task-10")
             results["checks"].append({
                 "name": c["name"], "type": c["type"], "target": c["target"],
                 "expect": c["expect"], **res,
