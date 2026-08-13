@@ -55,6 +55,12 @@ MAX_WORKLOADS = 6
 MAX_CHECKS = 10
 
 
+def _to_short_ref(image: str) -> str:
+    """Reduce an image ref to `<name>:<tag>` for console display."""
+    from app.agents.k8s_image import _to_short_name
+    return _to_short_name(image)
+
+
 def _default_llm() -> StepfunClient | None:
     """Build a StepfunClient from settings if an API key is configured."""
     try:
@@ -554,6 +560,24 @@ async def run_experiment(
                              detail=f"{w['kind']} · {w['image'] or '(见 yaml)'} · replicas={w['replicas']}",
                              task_id="task-10",
                              task_progress=min(45, 25 + i * 3))
+
+            # 0. Ensure the image is mirrored into Harbor BEFORE applying.
+            #    The cluster can only pull from the internal registry; if the
+            #    LLM referenced an image that isn't there yet, mirror it from
+            #    the public upstream via the control plane.
+            if w.get("image"):
+                from app.agents.k8s_image import ensure_harbor_configured, ensure_image_mirrored
+                await ensure_harbor_configured()
+                ok, msg = await ensure_image_mirrored(kc_path, w["image"])
+                if ok:
+                    yield AgentEvent(phase="validate", level="log",
+                                     title=f"镜像就绪: {_to_short_ref(w['image'])}",
+                                     detail=msg, task_id="task-10")
+                else:
+                    yield AgentEvent(phase="validate", level="warn",
+                                     title=f"镜像不可用: {w['image']}",
+                                     detail=msg, task_id="task-10")
+
             rc, out, err = await _apply_workload(kc_path, w["yaml"])
             results["applied"].append({"name": w["name"], "kind": w["kind"], "image": w["image"],
                                        "rc": rc, "out": out.strip(), "err": err.strip()})
