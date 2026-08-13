@@ -393,8 +393,12 @@ async def validate_with_k8s(
 
     # 3. Wait for scheduling + capture benchmark output.
     # Phase C: try kubectl-wait first (cleaner than the manual poll).
-    # Falls through to the manual poll loop if wait fails or the
-    # pod takes longer than the wait timeout to reach Running.
+    # The pod's benchmark command runs in the main container and then the
+    # pod exits — so the terminal phase is Succeeded (rc=0) or Failed.
+    # Waiting only for `Running` is NOT enough: at that point the
+    # benchmark is still executing and its stdout (the metrics we parse)
+    # has not been emitted yet. We wait for a terminal phase, with the
+    # manual poll as a fallback that reports live status along the way.
     yield AgentEvent(
         phase="validate", level="info",
         title="等待 Pod 调度",
@@ -409,20 +413,11 @@ async def validate_with_k8s(
     poll_env = {**os.environ, "KUBECONFIG": kc_path}
     poll_pod_name = test_pod_name  # airw-bench-<short>, set in apply step
     poll_tick = 0
-    # Race fix: spawn kubectl wait as a background task so the
-    # manual poll can break out as soon as wait confirms Running.
-    # Without this fix, kubectl wait would block the await for up
-    # to workload.timeout_sec, then the manual poll would loop
-    # for ANOTHER full workload.timeout_sec producing redundant
-    # "pod poll t=Ns: Running" events. The fix:
-    #   1. Spawn the wait as a Task. We never yield its events
-    #      inline — instead, the poll loop checks wait_task state.
-    #   2. In the poll loop, after each tick where the pod is
-    #      already Running/Succeeded/Failed, check if wait finished
-    #      with rc=0. If yes, emit ONE "kubectl wait succeeded"
-    #      event and break out.
-    #   3. At the end, clean up the wait task (cancel if still
-    #      running). Without this, the subprocess leaks.
+    # Spawn kubectl wait as a background task targeting the TERMINAL phase
+    # (Succeeded/Failed). The manual poll loop monitors its state and emits
+    # progress events; once the pod reaches a terminal phase we break out
+    # without waiting for the poll's full timeout.
+    TERMINAL_PHASES = ("Succeeded", "Failed")
 
     async def _run_kubectl_wait() -> int:
         """Returns the subprocess returncode; -1 if exec failed."""
@@ -430,8 +425,8 @@ async def validate_with_k8s(
             wait_proc = await asyncio.create_subprocess_exec(
                 "kubectl", "--kubeconfig", kc_path,
                 "wait", f"--namespace={ns}",
-                f"--for=jsonpath={{.status.phase}}=Running",
-                f"--timeout={min(workload.timeout_sec, 90)}s",
+                f"--for=jsonpath={{.status.phase}} in (Succeeded Failed)",
+                f"--timeout={min(workload.timeout_sec, 120)}s",
                 f"pod/{poll_pod_name}",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -464,7 +459,9 @@ async def validate_with_k8s(
     try:
         # Manual poll loop: status check + per-tick progress event.
         # Stays bounded by workload.timeout_sec so a slow cluster
-        # can't pin us here forever.
+        # can't pin us here forever. Breaks out only on a terminal
+        # phase (Succeeded/Failed) so the benchmark's stdout is
+        # complete before we capture the logs below.
         while time.time() - start < workload.timeout_sec:
             await asyncio.sleep(3)
             poll_tick += 1
@@ -512,17 +509,15 @@ async def validate_with_k8s(
                 task_id="task-10",
                 task_progress=min(85, 60 + poll_tick * 1),
             )
-            if final_status in ("Running", "Succeeded", "Failed"):
-                # Race fix: check if kubectl wait already succeeded.
-                # If yes, emit the success event and break out
-                # immediately instead of waiting for the next tick.
+            if final_status in TERMINAL_PHASES:
+                # Check if kubectl wait already confirmed the terminal phase.
                 if wait_task.done() and not wait_succeeded:
                     rc = wait_task.result()
                     if rc == 0:
                         wait_succeeded = True
                         yield AgentEvent(
                             phase="validate", level="info",
-                            title="pod 已 Running（kubectl wait 通过）",
+                            title="pod 已到终态（kubectl wait 通过）",
                             detail=f"等待 {int(time.time() - start)}s",
                             task_id="task-10", task_progress=75,
                         )
@@ -540,9 +535,13 @@ async def validate_with_k8s(
 
     # 4. Capture results + run benchmark, parse metrics, write artifact.
     not_scheduled = not bool(node_name)
-    is_terminal = final_status in ("Running", "Succeeded", "Failed")
-    if final_status in ("Running", "Succeeded") and not not_scheduled:
+    is_terminal = final_status in ("Succeeded", "Failed")
+    if final_status == "Succeeded" and not not_scheduled:
         level = "success"
+    elif final_status == "Failed" and not not_scheduled:
+        # Benchmark command exited non-zero — the pod ran but the workload
+        # failed. Surface it as a warning (the pod DID execute).
+        level = "warn"
     else:
         level = "warn"
     detail = (
