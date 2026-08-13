@@ -43,7 +43,6 @@ export function ResearchForm() {
     queryFn: () => knowledgeApi.listStyles(),
   });
   const availableStyles: KnowledgeStyle[] = stylesData?.items ?? [];
-  const selectedStylePreview = availableStyles.find((s) => s.id === form.style_id);
   const [form, setForm] = React.useState({
     title: "",
     goal: "",
@@ -56,6 +55,7 @@ export function ResearchForm() {
     use_custom_style: 0,        // 0=default 14-dim, 1=use a KnowledgeStyle
     style_id: null as string | null,  // Phase B: null = use currently active style
   });
+  const selectedStylePreview = availableStyles.find((s) => s.id === form.style_id);
   const [templatesOpen, setTemplatesOpen] = React.useState(false);
   // "一句话生成" state: subject input + generated plan preview.
   const [quickOpen, setQuickOpen] = React.useState(false);
