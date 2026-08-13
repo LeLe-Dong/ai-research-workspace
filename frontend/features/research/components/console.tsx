@@ -557,9 +557,11 @@ export function Console({
             {filteredEvents.map((e, idx) => {
               const level = (["info", "success", "warn", "error", "log"].includes(e.level) ? e.level : "info") as LogLevel;
               const hasDetail = !!e.detail && e.detail.length > 0;
-              // Auto-expand all details when a task filter is active, so users
-              // can see the full runtime trace per task without clicking each row.
-              const isOpen = taskId ? hasDetail : expanded.has(e.id);
+              // Auto-expand details while running (or when a task filter is
+              // active) so the user sees the full live trace (benchmark logs,
+              // reasoning, tool calls) without clicking each row; collapses
+              // once the research completes.
+              const isOpen = (taskId || isRunning) ? hasDetail : expanded.has(e.id);
               const isHighlight = currentMatchIdx >= 0 && filteredEvents[currentMatchIdx]?.id === e.id;
               const task = e.task_id ? taskNameById[e.task_id] : null;
               const isJson = hasDetail && isJsonString(e.detail);

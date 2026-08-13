@@ -193,8 +193,20 @@ export function ResearchForm() {
     }
     try {
       const r = await create.mutateAsync(form);
-      toast.success("研究已创建", { description: r.title });
-      router.push(`/research/${r.id}`);
+      toast.success("研究已创建，正在启动...", { description: r.title });
+      // Auto-start the research and jump straight to the execution view so
+      // the user doesn't have to click "开始研究" multiple times.
+      try {
+        const { API_BASE } = await import("@/lib/api");
+        const res = await fetch(`${API_BASE}/api/v1/researches/${r.id}/start`, { method: "POST" });
+        if (!res.ok) {
+          const body = await res.text();
+          toast.warning("创建成功但自动启动失败，请手动开始", { description: body.slice(0, 120) });
+        }
+      } catch {
+        toast.warning("自动启动失败，请在执行页手动开始");
+      }
+      router.push(`/research/${r.id}/execute`);
     } catch (err) {
       toast.error("创建研究失败", {
         description: (err as Error).message,
