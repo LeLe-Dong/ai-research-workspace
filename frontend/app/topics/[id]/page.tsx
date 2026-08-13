@@ -33,10 +33,10 @@ export default function TopicDetailPage() {
   const [iterOpen, setIterOpen] = useState(false);
 
   const latest = data?.sessions?.[data.sessions.length - 1];
+  const isFirstRound = !latest;
 
   const handleIterate = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!latest) return;
     try {
       await iterate.mutateAsync({
         topicId,
@@ -46,6 +46,10 @@ export default function TopicDetailPage() {
         commit_message: commitMsg,
       });
       setIterOpen(false);
+      setNextGoal("");
+      setNextConstraints("");
+      setNextOutput("");
+      setCommitMsg("");
       router.refresh();
     } catch {
       /* toast in hook */
@@ -127,56 +131,56 @@ export default function TopicDetailPage() {
             </div>
           ))}
 
-          {/* Next iteration form */}
-          {latest && (
-            <div className="ml-10">
-              <Button variant="outline" size="sm" onClick={() => setIterOpen(!iterOpen)} className="mb-3">
-                <Play className="mr-1.5 h-3.5 w-3.5 text-emerald-500" />
-                {iterOpen ? "收起" : "发起下一轮迭代"}
-              </Button>
-              {iterOpen && (
-                <Card>
-                  <CardHeader className="pb-3">
-                    <CardTitle className="text-sm flex items-center gap-2">
-                      <Target className="h-4 w-4 text-emerald-500" />
-                      第 {sessions.length + 1} 轮 · 调整研究边界
-                    </CardTitle>
-                  </CardHeader>
-                  <CardContent>
-                    <form onSubmit={handleIterate} className="space-y-3">
-                      <p className="text-xs text-muted-foreground">
-                        留空则继承上一轮的边界；填写则覆盖。上一轮目标：<span className="text-foreground/70">{latest.goal.slice(0, 60)}...</span>
-                      </p>
-                      <div className="space-y-1.5">
-                        <label className="text-xs text-muted-foreground">本轮研究目标（覆盖）</label>
-                        <Textarea value={nextGoal} onChange={(e) => setNextGoal(e.target.value)} rows={3}
-                          placeholder={latest.goal} />
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="text-xs text-muted-foreground">约束条件（覆盖）</label>
-                        <Textarea value={nextConstraints} onChange={(e) => setNextConstraints(e.target.value)} rows={2}
-                          placeholder={latest.constraints || "（无）"} />
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="text-xs text-muted-foreground">预期产出（覆盖）</label>
-                        <Textarea value={nextOutput} onChange={(e) => setNextOutput(e.target.value)} rows={2}
-                          placeholder={latest.expected_output || "（无）"} />
-                      </div>
-                      <div className="space-y-1.5">
-                        <label className="text-xs text-muted-foreground">本次调整说明（commit message）</label>
-                        <Input value={commitMsg} onChange={(e) => setCommitMsg(e.target.value)}
-                          placeholder="如：第1轮发现哨兵扩展性差，本轮转向 Cluster" />
-                      </div>
-                      <Button type="submit" disabled={iterate.isPending} className="w-full">
-                        {iterate.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Play className="mr-2 h-4 w-4" />}
-                        启动第 {sessions.length + 1} 轮研究
-                      </Button>
-                    </form>
-                  </CardContent>
+          {/* First round OR next iteration form */}
+          <div className="ml-10">
+            <Button variant="outline" size="sm" onClick={() => setIterOpen(!iterOpen)} className="mb-3">
+              <Play className="mr-1.5 h-3.5 w-3.5 text-emerald-500" />
+              {iterOpen ? "收起" : isFirstRound ? "开始第 1 轮研究" : "发起下一轮迭代"}
+            </Button>
+            {iterOpen && (
+              <Card>
+                <CardHeader className="pb-3">
+                  <CardTitle className="text-sm flex items-center gap-2">
+                    <Target className="h-4 w-4 text-emerald-500" />
+                    {isFirstRound ? `第 1 轮 · 定义研究边界` : `第 ${sessions.length + 1} 轮 · 调整研究边界`}
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <form onSubmit={handleIterate} className="space-y-3">
+                    <p className="text-xs text-muted-foreground">
+                      {isFirstRound
+                        ? "填写本轮研究目标（可留空，将基于主题名自动生成）"
+                        : "留空则继承上一轮的边界；填写则覆盖。"}
+                    </p>
+                    <div className="space-y-1.5">
+                      <label className="text-xs text-muted-foreground">研究目标</label>
+                      <Textarea value={nextGoal} onChange={(e) => setNextGoal(e.target.value)} rows={3}
+                        placeholder={isFirstRound ? `对「${data.name}」进行系统性预研...` : latest?.goal} />
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="text-xs text-muted-foreground">约束条件</label>
+                      <Textarea value={nextConstraints} onChange={(e) => setNextConstraints(e.target.value)} rows={2}
+                        placeholder={latest?.constraints || "（无）"} />
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="text-xs text-muted-foreground">预期产出</label>
+                      <Textarea value={nextOutput} onChange={(e) => setNextOutput(e.target.value)} rows={2}
+                        placeholder={latest?.expected_output || "（无）"} />
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="text-xs text-muted-foreground">说明（commit message）</label>
+                      <Input value={commitMsg} onChange={(e) => setCommitMsg(e.target.value)}
+                        placeholder={isFirstRound ? "如：首轮研究，确定基线" : "如：第1轮发现哨兵扩展性差，本轮转向 Cluster"} />
+                    </div>
+                    <Button type="submit" disabled={iterate.isPending} className="w-full">
+                      {iterate.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Play className="mr-2 h-4 w-4" />}
+                      {isFirstRound ? "启动第 1 轮研究" : `启动第 ${sessions.length + 1} 轮研究`}
+                    </Button>
+                  </form>
+                </CardContent>
                 </Card>
               )}
             </div>
-          )}
         </div>
 
         {/* Sidebar */}

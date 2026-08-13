@@ -163,9 +163,15 @@ async def iterate_topic(
     if latest is not None and not body.goal and body.commit_message:
         pass  # keep base boundary
 
+    # First round of a fresh topic: if no goal was supplied, derive a usable
+    # one from the topic name so the research is immediately executable.
+    goal = body.goal if body.goal is not None else (base.goal if base else "")
+    if not goal.strip():
+        goal = f"对「{t.name}」进行系统性预研：梳理背景、对比主流方案、识别关键权衡，并给出可落地的推荐与实施建议。"
+
     new_r = Research(
         title=title,
-        goal=body.goal if body.goal is not None else (base.goal if base else ""),
+        goal=goal,
         constraints=body.constraints if body.constraints is not None else (base.constraints if base else ""),
         expected_output=body.expected_output if body.expected_output is not None else (base.expected_output if base else ""),
         depth=body.depth or (base.depth if base else "standard"),
