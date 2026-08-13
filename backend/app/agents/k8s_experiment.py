@@ -62,19 +62,44 @@ def _to_short_ref(image: str) -> str:
 
 
 def _default_llm() -> StepfunClient | None:
-    """Build a StepfunClient from settings if an API key is configured."""
+    """Build an OpenAI-compatible client for experiment planning.
+
+    Priority:
+      1. deepseek-v4-flash via OpenCode Go (opencode.ai/zen/go/v1) — key read
+         from opencode's auth.json; this is what the researcher agent uses.
+      2. AIRW_STEPFUN_* env as fallback (historically the default).
+    Returns None if no key is available.
+    """
     try:
+        # 1. OpenCode Go (deepseek) — read the key opencode itself uses.
+        import json as _json
+        import os as _os
+        auth_path = _os.path.expanduser("~/.local/share/opencode/auth.json")
+        if _os.path.exists(auth_path):
+            try:
+                auth = _json.load(open(auth_path))
+                go_key = (auth.get("opencode-go") or {}).get("key") or ""
+                if go_key:
+                    return StepfunClient(
+                        api_key=go_key,
+                        base_url="https://opencode.ai/zen/go/v1",
+                        model="deepseek-v4-flash",
+                        timeout=90.0,
+                    )
+            except Exception:
+                pass
+        # 2. Stepfun fallback
         from app.core.config import settings
-        if not settings.stepfun_api_key:
-            return None
-        return StepfunClient(
-            api_key=settings.stepfun_api_key,
-            base_url=settings.stepfun_base_url or "https://api.stepfun.com/step_plan/v1",
-            model=settings.stepfun_model or "step-3.7-flash",
-            timeout=90.0,
-        )
+        if settings.stepfun_api_key:
+            return StepfunClient(
+                api_key=settings.stepfun_api_key,
+                base_url=settings.stepfun_base_url or "https://api.stepfun.com/step_plan/v1",
+                model=settings.stepfun_model or "step-3.7-flash",
+                timeout=90.0,
+            )
     except Exception:
-        return None
+        pass
+    return None
 
 
 EXPERIMENT_SYSTEM = """你是 Kubernetes 专家，负责为一项 AI 预研课题设计"可执行的验证试验"。
@@ -184,8 +209,28 @@ async def _ask_hermes_for_experiment(
     cmd = [hermes_bin, "chat", "-q", prompt, "--cli",
            "--max-turns", "3", "--yolo", "-p", profile, "-s", skills]
     logger.info("Running hermes k8s-expert for experiment plan ...")
+
+    # Inject the OpenCode Go (deepseek) key into the subprocess environment.
+    # hermes reads provider keys from os.environ (source: env:OPENCODE_GO_API_KEY),
+    # NOT automatically from ~/.hermes/.env — without this the k8s-expert CLI
+    # gets HTTP 401 and the plan generation fails. We reuse the key opencode
+    # itself authenticates with (read from its auth.json).
+    import os as _os
+    sub_env = dict(_os.environ)
+    if not sub_env.get("OPENCODE_GO_API_KEY"):
+        try:
+            _auth_path = _os.path.expanduser("~/.local/share/opencode/auth.json")
+            if _os.path.exists(_auth_path):
+                _auth = json.load(open(_auth_path))
+                _go = (_auth.get("opencode-go") or {}).get("key") or ""
+                if _go:
+                    sub_env["OPENCODE_GO_API_KEY"] = _go
+        except Exception:
+            pass
+
     proc = await _asyncio.create_subprocess_exec(
         *cmd,
+        env=sub_env,
         stdout=_asyncio.subprocess.PIPE,
         stderr=_asyncio.subprocess.PIPE,
     )
@@ -356,6 +401,7 @@ async def _check_pod_ready(kc_path: str, ns: str, target: str, timeout_sec: int,
     deadline = asyncio.get_event_loop().time() + timeout_sec
     last_status = ""
     last_wait_ts = 0.0
+    import re as _re  # used in the status-line parser below
     while asyncio.get_event_loop().time() < deadline:
         rc, out, err = await _kubectl_async(
             ["--kubeconfig", kc_path, "get", "pod", "-n", ns,
@@ -378,7 +424,6 @@ async def _check_pod_ready(kc_path: str, ns: str, target: str, timeout_sec: int,
                 # state looks like {"running":{"startedAt":...}} or {"waiting":{"reason":"ContainerCreating"}}
                 reason = "running"
                 if "waiting" in state and "reason" in state:
-                    import re as _re
                     m = _re.search(r"reason\\?\":\\?\"([^\\\"]+)", state)
                     reason = m.group(1) if m else "waiting"
                 elif "terminated" in state and "reason" in state:
@@ -632,7 +677,14 @@ async def run_experiment(
                 # would CANCEL the running check task on timeout. Just sleep
                 # and re-check task.done().
                 await asyncio.sleep(2)
-            res = task.result()
+            try:
+                res = task.result()
+            except Exception as e:
+                # A single check crashing must not abort the whole experiment.
+                # Record it as a failed check and keep going (cleanup still
+                # runs in the outer finally).
+                logger.warning("check task %s raised: %s", c["name"], e)
+                res = {"passed": False, "evidence": f"检查执行异常: {type(e).__name__}: {str(e)[:150]}"}
             while not q.empty():
                 msg = q.get_nowait()
                 yield AgentEvent(phase="validate", level="log",

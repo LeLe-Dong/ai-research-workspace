@@ -45,12 +45,13 @@ async def _create_task_tree(session, research_id: str) -> list[Task]:
     return tasks
 
 
-async def run_research_job(research_id: str, timeout_sec: int = 900) -> None:
+async def run_research_job(research_id: str, timeout_sec: int = 1800) -> None:
     """Background coroutine. Consumes agent events and persists state.
 
     Args:
         research_id: research to execute
-        timeout_sec: max execution time before forced failure (default 15 min)
+        timeout_sec: max execution time before forced failure (default 30 min —
+        generous so LLM-driven k8s experiments with long assertions can finish)
     """
     print(f"[executor] starting job for {research_id}", file=sys.stderr, flush=True)
     try:
@@ -92,6 +93,9 @@ async def run_research_job(research_id: str, timeout_sec: int = 900) -> None:
                 expected_output=research.expected_output,
                 depth=research.depth,
                 priority=research.priority,
+                requires_k8s_validation=research.requires_k8s_validation,
+                use_custom_style=research.use_custom_style,
+                style_id=research.style_id,
             )
 
             client = get_agent_client()
@@ -105,6 +109,19 @@ async def run_research_job(research_id: str, timeout_sec: int = 900) -> None:
                         now = datetime.utcnow()
 
                         if evt.phase != "progress":
+                            # Resolve task_id early so the timeline row can
+                            # carry the FK. Lookup is the same one used below
+                            # for Task mutations — no extra DB hit.
+                            resolved_task_id: str | None = None
+                            if evt.task_id:
+                                try:
+                                    idx = int(evt.task_id.split("-")[1])
+                                except (ValueError, IndexError):
+                                    idx = -1
+                                t = task_by_idx.get(idx)
+                                if t:
+                                    resolved_task_id = t.id
+
                             session.add(TimelineEvent(
                                 research_id=research_id,
                                 ts=now,
@@ -113,6 +130,7 @@ async def run_research_job(research_id: str, timeout_sec: int = 900) -> None:
                                 title=evt.title,
                                 detail=evt.detail,
                                 sequence=event_count,
+                                task_id=resolved_task_id,
                             ))
 
                         if evt.task_id:
@@ -201,6 +219,39 @@ async def run_research_job(research_id: str, timeout_sec: int = 900) -> None:
                             # (see artifact handler above). No more mock fallback.
 
                         await session.commit()
+
+                        # Push events to in-memory bus for true real-time SSE.
+                        # Anything the executor just wrote is published here
+                        # without waiting for the SSE poller's next 1s tick.
+                        # Skip "progress" events (they're for task-progress only,
+                        # not timeline rows).
+                        if evt.phase != "progress":
+                            try:
+                                await event_bus.publish(research_id, "timeline", {
+                                    "id": f"pending-{event_count}",
+                                    "ts": now.isoformat(),
+                                    "phase": evt.phase,
+                                    "level": evt.level,
+                                    "title": evt.title,
+                                    "detail": (evt.detail or "")[:2000],
+                                    "sequence": event_count,
+                                    "task_id": resolved_task_id,
+                                })
+                            except Exception:
+                                # Bus publish failure must never break execution.
+                                pass
+                        if evt.artifact:
+                            try:
+                                await event_bus.publish(research_id, "artifact", {
+                                    "id": f"pending-{event_count}",
+                                    "kind": evt.artifact["kind"],
+                                    "title": evt.artifact["title"],
+                                    "content": evt.artifact["content"],
+                                    "version": 1,
+                                    "created_at": now.isoformat(),
+                                })
+                            except Exception:
+                                pass
 
             except asyncio.TimeoutError:
                 print(f"[executor] TIMEOUT {research_id} after {timeout_sec}s", file=sys.stderr, flush=True)
