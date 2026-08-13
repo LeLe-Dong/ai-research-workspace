@@ -156,8 +156,18 @@ async def ensure_image_mirrored(kc_path: str, image: str, upstream_registry: str
     """Ensure `image` is available in Harbor for the cluster.
 
     `image` is the full reference the experiment manifest uses — we normalize
-    it to `registry.adms.io:31542/library/<path>:<tag>` and, if missing, pull
-    from the upstream mirror and push.
+    it to `registry.adms.io:31542/library/<name>:<tag>` and, if missing, pull
+    it locally and push.
+
+    Upstream strategy (in order):
+      1. docker.m.daocloud.io/library/<name>:<tag>  (official library images)
+      2. docker.1panel.live/<name>:<tag>            (hot 3rd-party namespaces,
+                                                     e.g. bitnami/jenkins/clickhouse)
+      3. docker.io/<name>:<tag>                     (direct docker.io as last
+                                                     resort — usually blocked)
+    The daemon's registry-mirrors are also configured to the same set, so a
+    plain `docker pull <name>:<tag>` would fall through the mirrors too; we
+    try explicit upstreams to keep control + accurate error reporting.
 
     Returns (ok, message).
     """
@@ -167,23 +177,44 @@ async def ensure_image_mirrored(kc_path: str, image: str, upstream_registry: str
     if await _docker_manifest_exists(kc_path, target):
         return True, f"镜像已在 Harbor: {target}"
 
-    # Pull from upstream (daocloud mirror or the docker.io default).
-    upstream = upstream_registry or "docker.m.daocloud.io/library"
-    src = f"{upstream}/{short}" if not upstream.endswith("/library") else f"{upstream}/{short}"
-    # Handle plain short refs: prepend library
-    if not image.startswith(("registry.", "docker.io", "docker.m.")):
-        pass
+    # Name may carry a 3rd-party namespace (bitnami/postgresql:16). For the
+    # daocloud official path we'd need library/; for the 3rd-party proxies we
+    # keep the full namespace. Build candidate upstream refs accordingly.
+    has_ns = "/" in short.split(":")[0]
+    short_tag = short  # e.g. bitnami/postgresql:16  or  redis:8.0
 
-    rc, out, err = await _run_shell(f"docker pull {src}", timeout=400)
-    if rc != 0:
-        # retry with the plain docker.io source
-        src2 = f"docker.io/library/{short}"
-        rc, out, err = await _run_shell(f"docker pull {src2}", timeout=400)
-        if rc != 0:
-            return False, f"无法从公网拉取 {short}: {err[:200]}"
-    logger.info("pulled upstream %s", src)
+    candidates: list[str] = []
+    if has_ns:
+        # 3rd-party namespace: daocloud only serves library/, so go straight
+        # to 1panel.live then docker.io.
+        candidates = [
+            f"docker.1panel.live/{short_tag}",
+            f"docker.1ms.run/{short_tag}",
+            f"docker.io/{short_tag}",
+        ]
+    else:
+        candidates = [
+            f"docker.m.daocloud.io/library/{short_tag}",
+            f"docker.1panel.live/library/{short_tag}",
+            f"docker.io/library/{short_tag}",
+        ]
+    # Caller-supplied override wins.
+    if upstream_registry:
+        candidates.insert(0, f"{upstream_registry}/{short_tag}")
 
-    rc, out, err = await _run_shell(f"docker tag {src} {target} && docker push {target}", timeout=600)
+    pulled_src = ""
+    last_err = ""
+    for src in candidates:
+        rc, out, err = await _run_shell(f"docker pull {src}", timeout=400)
+        if rc == 0:
+            pulled_src = src
+            logger.info("pulled upstream %s", src)
+            break
+        last_err = err or f"rc={rc}"
+    if not pulled_src:
+        return False, f"无法从任何上游拉取 {short_tag} (最后错误: {last_err[:160]})"
+
+    rc, out, err = await _run_shell(f"docker tag {pulled_src} {target} && docker push {target}", timeout=600)
     if rc != 0:
         return False, f"推送到 Harbor 失败: {err[:200]}"
     return True, f"已镜像到 Harbor: {target}"
