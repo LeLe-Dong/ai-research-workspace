@@ -313,6 +313,27 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
                            e, w.get("name"), w_yaml[:120])
             continue
 
+    # Build the set of deployable resource names (metadata.name) + label
+    # selectors implied by them, so we can drop checks that reference
+    # resources the plan never actually deploys. LLM plans frequently list
+    # more checks than workloads (e.g. checks for redis-cluster-2/init that
+    # have no matching manifest) — those would burn the full timeout then
+    # fail. We surface them as skipped instead.
+    deployed_names = {str(w["name"]).lower() for w in cleaned_workloads}
+    # Also collect the app=<x> label that each workload's pod carries, if any.
+    deployed_apps: set[str] = set()
+    for w in cleaned_workloads:
+        try:
+            doc = yaml.safe_load(w["yaml"])
+            if isinstance(doc, dict):
+                md = doc.get("metadata") or {}
+                lbl = ((doc.get("spec") or {}).get("selector") or {}).get("matchLabels") or {}
+                for k, v in lbl.items():
+                    if k == "app":
+                        deployed_apps.add(str(v).lower())
+        except Exception:
+            pass
+
     cleaned_checks = []
     for c in checks:
         if not isinstance(c, dict):
@@ -321,12 +342,46 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
         if ctype not in ALLOWED_CHECK_TYPES:
             logger.warning("skipping unsupported check type: %s", ctype)
             continue
+        target = str(c.get("target", ""))[:200]
+        # Resolve what the check targets: a bare selector (app=x), a
+        # resource-qualified name (deployment/x), or a service name.
+        ref = target.strip()
+        # strip kind/ prefix
+        ref_low = ref.split("/")[-1].lower()
+        # label selector form: app=<name>  → name
+        if ref_low.startswith("app="):
+            ref_low = ref_low[len("app="):]
+        ref_low = ref_low.strip()
+        exists = (
+            (ref_low in deployed_names)
+            or (ref_low in deployed_apps)
+            or (ref_low and any(ref_low in n for n in deployed_names))
+        )
+        timeout = max(10, int(c.get("timeout_sec") or 90))
+        # Cap each check's wait so many checks can't pile up hundreds of
+        # seconds of serial timeouts (this was timing out whole researches).
+        timeout = min(timeout, 120)
+        if not exists:
+            logger.warning(
+                "skipping check %r: target %r has no matching workload "
+                "(deployed=%s)", c.get("name"), target, sorted(deployed_names)[:8]
+            )
+            cleaned_checks.append({
+                "name": str(c.get("name", ctype))[:80],
+                "type": ctype,
+                "target": target,
+                "expect": str(c.get("expect", ""))[:200],
+                "timeout_sec": 5,
+                "_skipped": True,
+                "evidence": f"目标 '{target}' 未在计划中部署，跳过",
+            })
+            continue
         cleaned_checks.append({
             "name": str(c.get("name", ctype))[:80],
             "type": ctype,
-            "target": str(c.get("target", ""))[:200],
+            "target": target,
             "expect": str(c.get("expect", ""))[:200],
-            "timeout_sec": max(10, int(c.get("timeout_sec") or 90)),
+            "timeout_sec": timeout,
         })
 
     return {
@@ -654,6 +709,8 @@ async def run_experiment(
                 q.put_nowait(msg)
 
             async def _run():
+                if c.get("_skipped"):
+                    return {"passed": False, "evidence": c.get("evidence", "跳过")}
                 if c["type"] == "pod_ready":
                     return await _check_pod_ready(kc_path, ns, c["target"], c["timeout_sec"], progress_cb=_progress)
                 elif c["type"] == "service_ready":

@@ -55,7 +55,18 @@ async def start(
     async def _wrap():
         async with lock:
             try:
-                await run_research_job(research_id)
+                # Timeout scales with research depth. Deep research with an
+                # LLM-driven k8s experiment (many long assertions) can exceed
+                # the 30 min default, so give deep/standard runs more headroom.
+                depth = r.depth or "standard"
+                needs_k8s = bool(getattr(r, "requires_k8s_validation", 0) == 1)
+                if depth == "deep":
+                    timeout = 3600 if needs_k8s else 2700
+                elif depth == "standard":
+                    timeout = 2700 if needs_k8s else 1800
+                else:  # quick
+                    timeout = 1800 if needs_k8s else 900
+                await run_research_job(research_id, timeout_sec=timeout)
             except Exception as e:
                 logger.exception(f"run_research_job failed for {research_id}")
                 # Mark as failed so it doesn't appear stuck
