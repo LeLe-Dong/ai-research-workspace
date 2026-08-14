@@ -394,6 +394,45 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
     }
 
 
+def _extract_container_command(manifest: str) -> str:
+    """Extract the command/args each container runs, for console display.
+
+    Walks spec.containers / initContainers in the manifest and formats the
+    shell command so the user can see exactly what the agent asked the pod
+    to execute (e.g. redis-benchmark -h redis -n 100000 ...).
+    """
+    try:
+        docs = list(yaml.safe_load_all(manifest))
+    except Exception:
+        return ""
+    out_lines: list[str] = []
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        spec = doc.get("spec") or {}
+        tmpl = spec.get("template") or {}
+        tspec = tmpl.get("spec") or spec  # Deployment/StatefulSet vs bare Pod
+        if not isinstance(tspec, dict):
+            continue
+        for grp, cts in (("init", tspec.get("initContainers") or []),
+                         ("", tspec.get("containers") or [])):
+            for c in cts or []:
+                if not isinstance(c, dict):
+                    continue
+                name = c.get("name", "?")
+                cmd = c.get("command") or []
+                args = c.get("args") or []
+                full = list(cmd) + list(args)
+                if not full:
+                    continue
+                joined = " ".join(str(x) for x in full)
+                if grp:
+                    out_lines.append(f"[init:{name}] {joined}")
+                else:
+                    out_lines.append(f"[{name}] {joined}")
+    return "\n".join(out_lines)
+
+
 async def _apply_workload(kc_path: str, manifest: str) -> tuple[int, str, str]:
     cmd = ["kubectl", "--kubeconfig", kc_path, "apply", "-f", "-"]
     proc = await asyncio.create_subprocess_exec(
@@ -558,7 +597,9 @@ async def _check_pod_log_match(kc_path: str, ns: str, target: str, substring: st
             return {"passed": True, "evidence": f"log contains '{substring}'"}
         seen = out or ""
         if progress_cb is not None:
-            tail = "\n".join(seen.splitlines()[-6:])
+            # Show the FULL log tail (not just 6 lines) so the execution
+            # process — command output, progress lines, errors — is visible.
+            tail = "\n".join(seen.splitlines()[-40:])
             if tail and tail != last_seen:
                 last_seen = tail
                 await progress_cb(f"[pod_log_match] 日志尾部:\n{tail}")
@@ -688,6 +729,14 @@ async def run_experiment(
                                  title=f"已应用 {w['kind']} {w['name']}",
                                  detail=(out.strip() or "applied")[:400],
                                  task_id="task-10")
+                # Also surface the container command/args that the agent put in
+                # the manifest — the user wants to SEE what the pod will run.
+                cmd_txt = _extract_container_command(w.get("yaml", ""))
+                if cmd_txt:
+                    yield AgentEvent(phase="validate", level="log",
+                                     title=f"容器命令: {w['name']}",
+                                     detail=cmd_txt[:600],
+                                     task_id="task-10")
             else:
                 yield AgentEvent(phase="validate", level="error",
                                  title=f"应用 {w['name']} 失败", detail=err[:200],
