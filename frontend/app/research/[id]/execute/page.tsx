@@ -26,9 +26,9 @@ import {
 import { useResearch } from "@/features/research/hooks";
 import { useResearchStream } from "@/features/research/hooks-execute-sse";
 
-const DEFAULT_TASK_WIDTH = 256;
-const DEFAULT_TIMELINE_WIDTH = 320;
-const DEFAULT_CONSOLE_HEIGHT = 280;
+const DEFAULT_TASK_WIDTH = 220;
+const DEFAULT_TIMELINE_WIDTH = 460;
+const DEFAULT_CONSOLE_HEIGHT = 300;
 
 // Preset console heights (in pixels). Used by the S/M/L/全屏 buttons and
 // keyboard shortcuts.
@@ -326,8 +326,8 @@ export default function ExecutePage() {
               direction="horizontal"
               size={timelineWidth}
               onResize={setTimelineWidth}
-              min={240}
-              maxPercent={0.5}
+              min={320}
+              maxPercent={0.6}
               storageKey="timeline-width"
               ariaLabel="调整时间线宽度"
             />
