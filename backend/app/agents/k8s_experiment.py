@@ -725,7 +725,8 @@ async def run_experiment(
 
             rc, out, err = await _apply_workload(kc_path, w["yaml"])
             results["applied"].append({"name": w["name"], "kind": w["kind"], "image": w["image"],
-                                       "rc": rc, "out": out.strip(), "err": err.strip()})
+                                       "rc": rc, "out": out.strip(), "err": err.strip(),
+                                       "yaml": w["yaml"]})
             if rc == 0:
                 # Stream the manifest and kubectl's confirmation to the console
                 # so the user sees exactly what was deployed.
@@ -819,6 +820,25 @@ async def run_experiment(
                          task_id="task-10", task_progress=95)
 
         # 5. Persist artifact
+        # Attach a human-readable Chinese explanation to each check and each
+        # workload's container command, so the report / UI can say plainly
+        # WHAT point was verified, HOW (steps + exact command), and WHY a
+        # check passed/failed.
+        applied_with_cmd = []
+        for w in results["applied"]:
+            cmd_txt = _extract_container_command(w.get("manifest", w.get("yaml", "")))
+            applied_with_cmd.append({
+                "name": w["name"], "kind": w["kind"], "image": w["image"], "rc": w["rc"],
+                "command": cmd_txt,
+            })
+        checks_with_explain = []
+        for c in results["checks"]:
+            checks_with_explain.append({
+                **c,
+                "explain": _check_plain_language(c),
+                "fail_reason": _check_fail_reason(c),
+            })
+
         artifact = {
             "kind": "k8s-experiment",
             "experiment_name": plan["experiment"]["name"],
@@ -833,9 +853,8 @@ async def run_experiment(
                 f"{len(plan['checks'])} 项断言，覆盖目标中可实测的关键点。"
             ),
             "goal": goal,
-            "workloads": [{"name": w["name"], "kind": w["kind"], "image": w["image"], "rc": w["rc"]}
-                          for w in results["applied"]],
-            "checks": results["checks"],
+            "workloads": applied_with_cmd,
+            "checks": checks_with_explain,
             "passed": passed,
             "total": total,
         }
@@ -900,16 +919,38 @@ def append_empirical_section(report_md: str, research_id: str) -> str:
                 applied = d.get("workloads") or []
                 purpose = d.get("purpose") or ""
                 goal = d.get("goal") or ""
-                check_lines = "\n".join(
-                    f"  - {'✅' if c.get('passed') else '❌'} {c.get('name')} "
-                    f"[{c.get('type')} → {c.get('target')}] "
-                    f"expect={c.get('expect')}: {c.get('evidence', '')[:120]}"
-                    for c in checks
-                ) or "  - (无断言)"
-                wl_lines = "\n".join(
-                    f"  - {w.get('kind')} `{w.get('name')}` · {w.get('image') or '(见 manifest)'}"
-                    for w in applied
-                ) or "  - (无工作负载)"
+
+                # Plain-language verification details: one block per check,
+                # covering WHAT goal point, HOW (steps + command), and WHY.
+                detail_lines = []
+                for c in checks:
+                    status = "✅ 通过" if c.get("passed") else ("⏭️ 跳过" if (c.get("skipped") or c.get("_skipped")) else "❌ 失败")
+                    lines = [
+                        f"**{c.get('name')}** — {status}",
+                    ]
+                    explain = c.get("explain") or _check_plain_language(c)
+                    lines.append(f"- 验证点：{explain}")
+                    # The command that was executed inside the pod, if any.
+                    cmd = _command_for_check(c, applied)
+                    if cmd:
+                        lines.append(f"- 执行的命令：`{cmd}`")
+                    fail_reason = c.get("fail_reason") or _check_fail_reason(c)
+                    if not c.get("passed"):
+                        lines.append(f"- 未通过原因：{fail_reason}")
+                    detail_lines.append("\n".join(lines))
+
+                detail_block = "\n\n".join(detail_lines) or "  - (无断言)"
+
+                # Workloads + their container commands.
+                wl_lines = []
+                for w in applied:
+                    line = f"  - {w.get('kind')} `{w.get('name')}` · {w.get('image') or '(见 manifest)'}"
+                    cmd_txt = w.get("command") or ""
+                    if cmd_txt:
+                        line += f"\n    - 容器命令：`{cmd_txt[:300]}`"
+                    wl_lines.append(line)
+                wl_block = "\n".join(wl_lines) or "  - (无工作负载)"
+
                 empirical_section = (
                     "\n\n---\n\n"
                     "## 15. 实证数据（K8s 集群实测）\n\n"
@@ -919,8 +960,8 @@ def append_empirical_section(report_md: str, research_id: str) -> str:
                     f"- **试验**: {wl}\n"
                     f"- **集群**: {d.get('cluster', '?')} · 隔离命名空间 `{d.get('namespace', '?')}`\n"
                     f"- **断言通过率**: **{passed}/{total}**\n\n"
-                    f"### 部署的工作负载\n\n{wl_lines}\n\n"
-                    f"### 验证断言结果（逐项）\n\n{check_lines}\n"
+                    f"### 部署的工作负载与执行的命令\n\n{wl_block}\n\n"
+                    f"### 逐项验证结果（验证点 / 步骤 / 命令 / 原因）\n\n{detail_block}\n"
                 )
             elif val is not None:
                 d = _json.loads(val.content)
@@ -955,3 +996,95 @@ def append_empirical_section(report_md: str, research_id: str) -> str:
     except Exception:
         # Never let a report-append failure break the research run.
         return report_md
+
+
+_TYPE_CN = {
+    "pod_ready": "Pod 就绪检查",
+    "service_ready": "Service 可用性检查",
+    "pod_log_match": "Pod 日志内容检查",
+    "http_ok": "HTTP 访问检查",
+}
+
+
+def _command_for_check(c: dict, applied: list[dict]) -> str:
+    """Find the container command related to a check.
+
+    Matches the check's target (app=x / deployment/x / service) against the
+    deployed workloads' names / labels, then returns that workload's command.
+    """
+    target = (c.get("target") or "").strip()
+    t = target.split("/")[-1]
+    if t.startswith("app="):
+        t = t[len("app="):]
+    t = t.strip().lower()
+    for w in applied:
+        name = str(w.get("name") or "").lower()
+        cmd = w.get("command") or ""
+        if cmd and (t and (t in name or name in t or t == name)):
+            return cmd
+    return ""
+
+
+def _check_plain_language(c: dict) -> str:
+    """Chinese plain-language description of what a check verifies & how.
+
+    Used in the report / UI so a reader understands, in plain words, which
+    goal point this assertion verifies, the verification step, and the
+    expected result — without parsing raw yaml/selectors.
+    """
+    ctype = c.get("type", "")
+    target = c.get("target", "")
+    expect = c.get("expect", "")
+    name = c.get("name", "")
+    tcn = _TYPE_CN.get(ctype, ctype)
+
+    if ctype == "pod_ready":
+        return (
+            f"检查名为「{name}」的目标（{target}）对应的 Pod 是否成功启动并进入就绪状态。"
+            f"做法：持续查询该 Pod 的状态，等待其 phase 变为 Running 且容器 Ready；"
+            f"期望：就绪。"
+        )
+    if ctype == "service_ready":
+        return (
+            f"检查名为「{name}」的 Service（{target}）是否可用——即它是否关联到了真实运行的 Pod。"
+            f"做法：查询该 Service 的 Endpoints，等待有可用 IP 出现；期望：有端点。"
+        )
+    if ctype == "pod_log_match":
+        return (
+            f"检查名为「{name}」的目标（{target}）的 Pod 日志中是否出现了预期内容「{expect}」。"
+            f"这用来验证容器内部执行的结果（如压测输出、初始化完成标记、错误提示）；"
+            f"做法：持续抓取该 Pod 的日志并匹配关键词；期望：日志包含「{expect}」。"
+        )
+    if ctype == "http_ok":
+        return (
+            f"检查 {target} 是否能通过 HTTP 访问（期望 {expect}）。"
+            f"做法：在命名空间内发起 HTTP 请求并检查响应码；期望：2xx。"
+        )
+    return f"对目标「{target}」执行 {tcn}，期望 {expect}。"
+
+
+def _check_fail_reason(c: dict) -> str:
+    """Plain-Chinese reason for why a check did not pass.
+
+    Falls back to the raw evidence when we can't derive a friendly reason.
+    """
+    if c.get("_skipped") or c.get("skipped"):
+        return "该检查对应的资源没有在试验计划中实际部署（计划不一致），因此跳过，不代表方案失败。"
+    if c.get("passed"):
+        return "检查通过，验证结果符合预期。"
+    evidence = c.get("evidence", "") or ""
+    ctype = c.get("type", "")
+    target = c.get("target", "")
+
+    if "超时" in evidence:
+        if ctype == "pod_ready":
+            return f"目标 {target} 的 Pod 在限定时间内一直没有就绪，最常见原因是：镜像拉取失败（ImagePullBackOff）、资源配额不足、或配置错误导致容器启动失败/反复重启。"
+        if ctype == "service_ready":
+            return f"Service {target} 在限定时间内一直没有可用端点，最常见原因是：对应的 Pod 没起来，或 Service 的标签选择器与 Pod 标签不匹配。"
+        if ctype == "pod_log_match":
+            return f"目标 {target} 的 Pod 日志在限定时间内一直没有出现期望的关键词，最常见原因是：容器内命令没执行到那一步、命令报错提前退出、或日志内容与预期不一致。"
+    if "未在计划中部署" in evidence or "没有匹配选择器" in evidence:
+        return f"检查目标「{target}」没有找到对应的已部署资源（计划生成与部署不一致），属于试验计划问题而非被测方案问题。"
+    if ctype == "pod_log_match" and "日志中未出现" in evidence:
+        return f"目标 {target} 的日志始终没有包含期望内容，说明容器内部验证命令没有成功执行或结果不符合预期（可能是服务未就绪、命令报错或断言关键词不对）。"
+    return evidence[:200]

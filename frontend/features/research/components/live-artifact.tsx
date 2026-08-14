@@ -152,14 +152,22 @@ export function K8sExperimentPanel({ artifact }: { artifact: ArtifactOut }) {
             </div>
             <div className="space-y-1">
               {workloads.map((w, i) => (
-                <div key={i} className="flex items-center justify-between rounded border px-2 py-1 text-xs">
-                  <span className="min-w-0 truncate">
-                    <span className="text-muted-foreground">{w.kind}</span>{" "}
-                    <span className="font-medium">{w.name}</span>
-                  </span>
-                  <span className="ml-2 shrink-0 truncate text-[10px] text-muted-foreground">
-                    {w.image || w.kind === "Service" ? "(Service)" : ""}
-                  </span>
+                <div key={i} className="rounded border px-2 py-1.5 text-xs">
+                  <div className="flex items-center justify-between">
+                    <span className="min-w-0 truncate">
+                      <span className="text-muted-foreground">{w.kind}</span>{" "}
+                      <span className="font-medium">{w.name}</span>
+                    </span>
+                    <span className="ml-2 shrink-0 truncate text-[10px] text-muted-foreground">
+                      {w.image || (w.kind === "Service" ? "(Service)" : "")}
+                    </span>
+                  </div>
+                  {w.command && (
+                    <p className="mt-1 whitespace-pre-wrap break-words rounded bg-black/5 p-1.5 font-mono text-[9px] leading-relaxed text-muted-foreground dark:bg-white/5">
+                      {w.command.slice(0, 300)}
+                      {w.command.length > 300 ? "…" : ""}
+                    </p>
+                  )}
                 </div>
               ))}
             </div>
@@ -202,8 +210,18 @@ export function K8sExperimentPanel({ artifact }: { artifact: ArtifactOut }) {
                     <span className="font-medium text-foreground/80">期望：</span>{c.expect}
                     {c.skipped && <span className="ml-1 text-zinc-500">（计划中未部署该资源，跳过）</span>}
                   </p>
-                  {c.evidence && (
-                    <p className="mt-1 whitespace-pre-wrap break-words rounded bg-black/5 p-1.5 text-[10px] leading-relaxed text-muted-foreground dark:bg-white/5">
+                  {c.explain && (
+                    <p className="mt-1.5 rounded bg-black/5 p-1.5 text-[10px] leading-relaxed text-muted-foreground dark:bg-white/5">
+                      <span className="font-medium text-foreground/80">验证点：</span>{c.explain}
+                    </p>
+                  )}
+                  {!c.passed && c.fail_reason && (
+                    <p className="mt-1 rounded bg-red-500/5 p-1.5 text-[10px] leading-relaxed text-red-600/90 dark:text-red-300/90">
+                      <span className="font-medium">未通过原因：</span>{c.fail_reason}
+                    </p>
+                  )}
+                  {c.evidence && !c.explain && (
+                    <p className="mt-0.5 whitespace-pre-wrap break-words text-[10px] text-muted-foreground/70">
                       {c.evidence}
                     </p>
                   )}
