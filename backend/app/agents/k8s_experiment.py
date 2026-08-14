@@ -185,10 +185,13 @@ async def _ask_hermes_for_experiment(
     # of just emitting JSON.
     prompt = (
         "你是K8s专家。只输出JSON，不要解释、不要markdown代码块、不要调用任何工具。\n"
-        "为这项研究设计可执行的K8s验证试验：\n\n"
-        "目标：\n" + (goal or "")[:800] + "\n\n"
-        "推荐方案：\n" + (recommendations_md or "")[:3000] + "\n\n"
+        "为这项研究设计可执行的K8s验证试验。\n\n"
+        "【研究目标（必须围绕它设计试验）】\n" + (goal or "")[:1200] + "\n\n"
+        "【研究发现/推荐方案（参考，不要偏离目标）】\n" + (recommendations_md or "")[:2000] + "\n\n"
         "要求：\n"
+        f"0. 试验必须直接验证【研究目标】中的关键点：把目标里提到的每个可测项"
+        "（如：高可用/故障切换、主从复制、Cluster分片、持久化、ACL、性能/吞吐等）"
+        "映射为具体的工作负载和断言。不要在目标没提的方向上另起炉灶，也不要遗漏目标里的核心验证项。\n"
         f"1. 命名空间必须用 {namespace}。\n"
         "2. 镜像只能用 registry.adms.io:31542/library/<image>:<tag>（redis:7.0.4/postgres:15/"
         "mysql:8.0/mongo:8.0/nginx:1.26.2-alpine/busybox:1.0）。\n"
@@ -198,8 +201,9 @@ async def _ask_hermes_for_experiment(
         "（redis-cli 没有 -t 参数，不要用 redis-cli -t）。\n"
         "5. 使用 mysql 镜像时，容器必须设置 MYSQL_ROOT_PASSWORD（或 MYSQL_ALLOW_EMPTY_PASSWORD=yes），"
         "否则 mysql 8 容器无法完成初始化；mysql 默认数据目录是 /var/lib/mysql。\n"
-        "5. 资源请求 cpu<=500m, memory<=512Mi。\n"
-        "6. 一个 workload 的 yaml 只放一个资源（多资源就放多个 workload 条目）。\n\n"
+        "6. 资源请求 cpu<=500m, memory<=512Mi。\n"
+        "7. 一个 workload 的 yaml 只放一个资源（多资源就放多个 workload 条目）。\n"
+        "8. 试验的 checks 必须与 workloads 一一对应，不要引用未部署的资源。\n\n"
         "JSON格式：\n"
         "{\"experiment\":{\"name\":\"x\",\"namespace\":\"" + namespace + "\"},"
         "\"workloads\":[{\"name\":\"x\",\"kind\":\"Deployment\",\"image\":\"registry.adms.io:31542/library/redis:7.0.4\",\"replicas\":1,\"yaml\":\"...\"}],"
@@ -820,6 +824,15 @@ async def run_experiment(
             "experiment_name": plan["experiment"]["name"],
             "namespace": ns,
             "cluster": kc_meta.get("name"),
+            # Purpose: what aspect of the research goal this experiment was
+            # designed to verify, so the report/UI can show the goal↔test
+            # mapping (the "预研目标 a ↔ 实测 a" alignment).
+            "purpose": (
+                "围绕研究目标部署真实工作负载并逐项验证："
+                f"{goal[:200]}。试验计划 {len(plan['workloads'])} 个工作负载、"
+                f"{len(plan['checks'])} 项断言，覆盖目标中可实测的关键点。"
+            ),
+            "goal": goal,
             "workloads": [{"name": w["name"], "kind": w["kind"], "image": w["image"], "rc": w["rc"]}
                           for w in results["applied"]],
             "checks": results["checks"],
@@ -885,6 +898,8 @@ def append_empirical_section(report_md: str, research_id: str) -> str:
                 passed = d.get("passed", 0)
                 total = d.get("total", 0)
                 applied = d.get("workloads") or []
+                purpose = d.get("purpose") or ""
+                goal = d.get("goal") or ""
                 check_lines = "\n".join(
                     f"  - {'✅' if c.get('passed') else '❌'} {c.get('name')} "
                     f"[{c.get('type')} → {c.get('target')}] "
@@ -898,11 +913,14 @@ def append_empirical_section(report_md: str, research_id: str) -> str:
                 empirical_section = (
                     "\n\n---\n\n"
                     "## 15. 实证数据（K8s 集群实测）\n\n"
-                    f"本研究已在 **{d.get('cluster', '?')}** 集群的隔离命名空间 "
-                    f"**`{d.get('namespace', '?')}`** 中，按 AI 生成的试验计划部署了以下工作负载并逐项断言：\n\n"
-                    f"**试验**: {wl} · **断言通过率**: {passed}/{total}\n\n"
-                    f"**部署的工作负载**\n{wl_lines}\n\n"
-                    f"**验证断言结果**\n{check_lines}\n"
+                    f"### 实测目的\n\n"
+                    f"{purpose or f'本试验围绕研究目标部署真实工作负载并验证其关键能力（研究目标：{goal[:200]}）。'}\n\n"
+                    f"### 试验概览\n\n"
+                    f"- **试验**: {wl}\n"
+                    f"- **集群**: {d.get('cluster', '?')} · 隔离命名空间 `{d.get('namespace', '?')}`\n"
+                    f"- **断言通过率**: **{passed}/{total}**\n\n"
+                    f"### 部署的工作负载\n\n{wl_lines}\n\n"
+                    f"### 验证断言结果（逐项）\n\n{check_lines}\n"
                 )
             elif val is not None:
                 d = _json.loads(val.content)

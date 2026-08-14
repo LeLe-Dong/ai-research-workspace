@@ -1,6 +1,6 @@
 "use client";
 import { useState, useMemo, lazy, Suspense } from "react";
-import { Download, FileText, GitBranch, BarChart3, CheckCircle2, Loader2 } from "lucide-react";
+import { Download, FileText, GitBranch, BarChart3, CheckCircle2, Loader2, Server, Target, ListChecks } from "lucide-react";
 
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -23,6 +23,8 @@ const ICON_FOR: Record<string, typeof FileText> = {
   markdown: FileText,
   table: BarChart3,
   review: CheckCircle2,
+  "k8s-experiment": Server,
+  "k8s-validation": Server,
 };
 
 function downloadArtifact(a: ArtifactOut) {
@@ -54,6 +56,146 @@ function RenderArtifact({ a }: { a: ArtifactOut }) {
     );
   }
   return <pre className="p-3 text-xs">{a.content}</pre>;
+}
+
+export function K8sExperimentPanel({ artifact }: { artifact: ArtifactOut }) {
+  let data: any = null;
+  try { data = JSON.parse(artifact.content); } catch { /* ignore */ }
+  if (!data || typeof data !== "object") {
+    return <pre className="p-3 text-xs">{artifact.content}</pre>;
+  }
+
+  const checks: any[] = data.checks ?? [];
+  const workloads: any[] = data.workloads ?? [];
+  const passed = data.passed ?? 0;
+  const total = data.total ?? checks.length;
+
+  const typeLabel: Record<string, string> = {
+    pod_ready: "Pod 就绪",
+    service_ready: "Service 端点",
+    pod_log_match: "日志匹配",
+    http_ok: "HTTP 可达",
+  };
+
+  return (
+    <div className="space-y-4 p-4">
+      {/* Purpose: what this experiment verifies (goal ↔ test alignment) */}
+      <Card>
+        <CardContent className="space-y-2 p-3">
+          <div className="flex items-center gap-2">
+            <Target className="h-3.5 w-3.5 text-cyan-500" />
+            <p className="text-xs font-semibold">实测目的</p>
+          </div>
+          <p className="text-xs leading-relaxed text-muted-foreground">
+            {data.purpose || "围绕研究目标部署真实工作负载并验证关键能力。"}
+          </p>
+          {data.goal && (
+            <p className="text-[10px] text-muted-foreground/70">
+              研究目标：{String(data.goal).slice(0, 200)}
+            </p>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Overview */}
+      <Card>
+        <CardContent className="space-y-2 p-3">
+          <div className="flex items-center gap-2">
+            <Server className="h-3.5 w-3.5 text-blue-500" />
+            <p className="text-xs font-semibold">试验概览</p>
+          </div>
+          <div className="grid grid-cols-2 gap-2 text-xs">
+            <div className="rounded border bg-muted/40 p-2">
+              <p className="text-[10px] text-muted-foreground">试验</p>
+              <p className="truncate font-medium">{data.experiment_name || "—"}</p>
+            </div>
+            <div className="rounded border bg-muted/40 p-2">
+              <p className="text-[10px] text-muted-foreground">集群</p>
+              <p className="font-medium">{data.cluster || "—"}</p>
+            </div>
+            <div className="rounded border bg-muted/40 p-2">
+              <p className="text-[10px] text-muted-foreground">命名空间</p>
+              <p className="truncate font-mono text-[10px]">{data.namespace || "—"}</p>
+            </div>
+            <div className="rounded border p-2" style={{ borderColor: total > 0 && passed === total ? "rgb(16 185 129 / 0.4)" : total === 0 ? undefined : "rgb(245 158 11 / 0.4)" }}>
+              <p className="text-[10px] text-muted-foreground">断言通过率</p>
+              <p className="font-bold">
+                {passed}/{total}
+                <span className="ml-1 text-[10px] font-normal text-muted-foreground">
+                  {total > 0 ? (passed === total ? "全部通过" : "有失败") : "无断言"}
+                </span>
+              </p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Workloads */}
+      {workloads.length > 0 && (
+        <Card>
+          <CardContent className="space-y-2 p-3">
+            <div className="flex items-center gap-2">
+              <ListChecks className="h-3.5 w-3.5 text-indigo-500" />
+              <p className="text-xs font-semibold">部署的工作负载（{workloads.length}）</p>
+            </div>
+            <div className="space-y-1">
+              {workloads.map((w, i) => (
+                <div key={i} className="flex items-center justify-between rounded border px-2 py-1 text-xs">
+                  <span className="min-w-0 truncate">
+                    <span className="text-muted-foreground">{w.kind}</span>{" "}
+                    <span className="font-medium">{w.name}</span>
+                  </span>
+                  <span className="ml-2 shrink-0 truncate text-[10px] text-muted-foreground">
+                    {w.image || w.kind === "Service" ? "(Service)" : ""}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Checks */}
+      {checks.length > 0 && (
+        <Card>
+          <CardContent className="space-y-2 p-3">
+            <div className="flex items-center gap-2">
+              <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
+              <p className="text-xs font-semibold">验证断言结果（{checks.length}）</p>
+            </div>
+            <div className="space-y-1.5">
+              {checks.map((c, i) => (
+                <div
+                  key={i}
+                  className="rounded border px-2 py-1.5 text-xs"
+                  style={{ borderColor: c.passed ? "rgb(16 185 129 / 0.3)" : "rgb(239 68 68 / 0.3)", background: c.passed ? "rgb(16 185 129 / 0.05)" : "rgb(239 68 68 / 0.05)" }}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="flex min-w-0 items-center gap-1.5">
+                      <span>{c.passed ? "✅" : "❌"}</span>
+                      <span className="truncate font-medium">{c.name}</span>
+                    </span>
+                    <Badge variant="outline" className="h-4 shrink-0 text-[9px]">
+                      {typeLabel[c.type] || c.type}
+                    </Badge>
+                  </div>
+                  <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
+                    target={c.target} · expect={c.expect}
+                    {c.skipped && " · (已跳过，计划未部署该资源)"}
+                  </p>
+                  {c.evidence && (
+                    <p className="mt-0.5 line-clamp-2 break-words text-[10px] text-muted-foreground/70">
+                      {c.evidence}
+                    </p>
+                  )}
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+    </div>
+  );
 }
 
 export function ReviewPanel({ review }: { review?: ReviewOut | null }) {
@@ -115,7 +257,11 @@ export function ReviewPanel({ review }: { review?: ReviewOut | null }) {
 
 export function LiveArtifact({ artifacts, review }: { artifacts?: ArtifactOut[]; review?: ReviewOut | null }) {
   const items = artifacts ?? [];
-  const defaultTab = items[0]?.id ?? "review";
+  // Prefer showing the k8s experiment first (real measured results), then
+  // the report; fall back to the first artifact.
+  const k8sItem = items.find((a) => a.kind === "k8s-experiment" || a.kind === "k8s-validation");
+  const reportItem = items.find((a) => a.kind === "markdown");
+  const defaultTab = k8sItem?.id ?? reportItem?.id ?? items[0]?.id ?? "review";
 
   return (
     <div className="flex h-full flex-col">
@@ -170,7 +316,11 @@ export function LiveArtifact({ artifacts, review }: { artifacts?: ArtifactOut[];
                   .{a.kind === "mermaid" ? "mmd" : "md"}
                 </Button>
               </div>
-              <RenderArtifact a={a} />
+              {a.kind === "k8s-experiment" ? (
+                <K8sExperimentPanel artifact={a} />
+              ) : (
+                <RenderArtifact a={a} />
+              )}
             </TabsContent>
           ))}
           {review && (
