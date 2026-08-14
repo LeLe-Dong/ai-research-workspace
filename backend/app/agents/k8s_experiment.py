@@ -732,7 +732,7 @@ async def run_experiment(
                 # so the user sees exactly what was deployed.
                 yield AgentEvent(phase="validate", level="log",
                                  title=f"已应用 {w['kind']} {w['name']}",
-                                 detail=(out.strip() or "applied")[:400],
+                                 detail=(out.strip() or "已应用")[:400],
                                  task_id="task-10")
                 # Also surface the container command/args that the agent put in
                 # the manifest — the user wants to SEE what the pod will run.
@@ -859,7 +859,7 @@ async def run_experiment(
             "total": total,
         }
         yield AgentEvent(phase="validate", level="info", title="试验结果已保存",
-                         detail="k8s-experiment artifact", task_id="task-10",
+                         detail="k8s 实测结果已保存为 artifact", task_id="task-10",
                          artifact={"kind": "k8s-experiment",
                                    "title": f"K8s 试验: {plan['experiment']['name']}",
                                    "content": json.dumps(artifact, ensure_ascii=False, indent=2)})
@@ -972,8 +972,33 @@ def append_empirical_section(report_md: str, research_id: str) -> str:
                 pod_status = d.get("pod_status", "?")
                 node = d.get("node") or "(未调度)"
                 image = d.get("image", "?")
+
+                # Chinese labels for the raw metric keys so the report is
+                # readable without translating TPS/latency jargon.
+                _METRIC_CN = {
+                    "tps_including": "TPS（含建连）",
+                    "tps_excluding": "TPS（不含建连）",
+                    "latency_avg_ms": "平均延迟(ms)",
+                    "latency_stddev_ms": "延迟标准差(ms)",
+                    "latency_p95_ms": "P95 延迟(ms)",
+                    "transactions_total": "总事务数",
+                    "queries": "查询数",
+                    "elapsed_ms": "耗时(ms)",
+                    "qps": "QPS",
+                    "set_rps": "SET 每秒请求数",
+                    "get_rps": "GET 每秒请求数",
+                    "set_p50_ms": "SET P50 延迟(ms)",
+                    "get_p50_ms": "GET P50 延迟(ms)",
+                    "set_p99_ms": "SET P99 延迟(ms)",
+                    "get_p99_ms": "GET P99 延迟(ms)",
+                    "ops_per_sec": "每秒操作数",
+                    "elapsed_sec": "耗时(s)",
+                    "inserted_docs": "插入文档数",
+                    "completed_at": "完成时间戳",
+                    "requests_completed": "完成请求数",
+                }
                 metric_lines = "\n".join(
-                    f"  - {k}: {v}" for k, v in metrics.items()
+                    f"  - {_METRIC_CN.get(k, k)}: {v}" for k, v in metrics.items()
                 ) or "  - (本轮未捕获到指标)"
                 resource_lines = "\n".join(
                     f"  - {k}: {v}" for k, v in resources.items()
@@ -987,8 +1012,8 @@ def append_empirical_section(report_md: str, research_id: str) -> str:
                     f"- 调度节点: {node}\n"
                     f"- 镜像: {image}\n"
                     f"- 状态: {pod_status} · 耗时: {elapsed}s\n\n"
-                    f"**Benchmark 指标**\n{metric_lines}\n\n"
-                    f"**资源使用**\n{resource_lines}\n"
+                    f"**实测指标**\n{metric_lines}\n\n"
+                    f"**资源使用情况**\n{resource_lines}\n"
                 )
         if empirical_section:
             return report_md.rstrip() + "\n" + empirical_section.lstrip("\n")

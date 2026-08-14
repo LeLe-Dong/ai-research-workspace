@@ -504,8 +504,8 @@ async def validate_with_k8s(
                            for c in status.get("conditions", [])]
             yield AgentEvent(
                 phase="validate", level="info",
-                title=f"pod poll t={elapsed}s (#{poll_tick}): {final_status}",
-                detail=f"node={node_name or '(未调度)'} ip={pod_ip or '-'} ready=" +
+                title=f"Pod 状态轮询 t={elapsed}s (#{poll_tick}): {final_status}",
+                detail=f"节点={node_name or '(未调度)'} IP={pod_ip or '-'} 就绪=" +
                        ",".join(c for c in conditions if c.startswith("Ready=")) or "-",
                 task_id="task-10",
                 task_progress=min(85, 60 + poll_tick * 1),
@@ -537,7 +537,7 @@ async def validate_with_k8s(
                             last_log_line_count = len(all_lines)
                             yield AgentEvent(
                                 phase="validate", level="log",
-                                title=f"benchmark 输出 (t={elapsed}s)",
+                                title=f"基准测试输出 (t={elapsed}s)",
                                 detail="\n".join(new_lines)[-2000:],
                                 task_id="task-10",
                             )
@@ -551,7 +551,7 @@ async def validate_with_k8s(
                         wait_succeeded = True
                         yield AgentEvent(
                             phase="validate", level="info",
-                            title="pod 已到终态（kubectl wait 通过）",
+                            title="Pod 已到终态（kubectl wait 通过）",
                             detail=f"等待 {int(time.time() - start)}s",
                             task_id="task-10", task_progress=75,
                         )
@@ -583,12 +583,12 @@ async def validate_with_k8s(
         f"耗时: {int(time.time() - start)}s · 条件: {', '.join(conditions) or '-'}"
     )
     if not is_terminal:
-        detail += " · pod 未进入终态，可能调度失败或镜像拉取异常"
+        detail += " · Pod 未进入终态，可能调度失败或镜像拉取异常"
     if not_scheduled:
         detail += " · 未调度到任何节点"
     yield AgentEvent(
         phase="validate", level=level,
-        title=f"k8s 验证完成: {final_status}",
+        title=f"K8s 验证完成: {final_status}",
         detail=detail,
         task_id="task-10", task_progress=90,
     )

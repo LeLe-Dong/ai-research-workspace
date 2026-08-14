@@ -304,10 +304,10 @@ export function LiveArtifact({ artifacts, review }: { artifacts?: ArtifactOut[];
     <div className="flex h-full flex-col">
       <div className="border-b px-4 py-3">
         <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-          LiveArtifact
+          产物面板
         </p>
         <p className="mt-0.5 text-[10px] text-muted-foreground">
-          {items.length} artifact{items.length === 1 ? "" : "s"} ready
+          {items.length} 个产物已就绪
         </p>
       </div>
 

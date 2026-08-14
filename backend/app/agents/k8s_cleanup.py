@@ -102,7 +102,7 @@ async def cleanup_research_resources(
         )).scalars().all()
 
     if not rows:
-        return {"summary": "no resources tracked for this research", "items": []}
+        return {"summary": "本研究的试验没有登记任何资源", "items": []}
 
     for r in rows:
         if r.deleted_at is not None:
@@ -166,7 +166,7 @@ async def cleanup_research_resources(
         })
 
     return {
-        "summary": f"cleanup walked {len(rows)} resource(s)",
+        "summary": f"清理流程处理了 {len(rows)} 个资源",
         "items": results,
     }
 
