@@ -530,7 +530,7 @@ async def _check_pod_ready(kc_path: str, ns: str, target: str, timeout_sec: int,
                 status_line += f"{name} [{phase}/{reason}] "
             status_line = status_line.strip()
             if ready:
-                return {"passed": True, "evidence": f"pod ready ({target}): {status_line}"}
+                return {"passed": True, "evidence": f"Pod 就绪（{target}）: {status_line}"}
             if progress_cb is not None and status_line != last_status:
                 last_status = status_line
                 last_wait_ts = asyncio.get_event_loop().time()
@@ -541,7 +541,7 @@ async def _check_pod_ready(kc_path: str, ns: str, target: str, timeout_sec: int,
             last_wait_ts = now
             await progress_cb(f"[pod_ready] 仍在等待就绪... ({int(deadline - now)}s 剩余)")
         await asyncio.sleep(3)
-    return {"passed": False, "evidence": f"timeout after {timeout_sec}s waiting pod ready ({target})"}
+    return {"passed": False, "evidence": f"超时 {timeout_sec}s 等待 Pod 就绪（{target}）"}
 
 
 async def _check_service_ready(kc_path: str, ns: str, service: str, timeout_sec: int,
@@ -559,7 +559,7 @@ async def _check_service_ready(kc_path: str, ns: str, service: str, timeout_sec:
         if rc == 0 and out.strip():
             svc = out.strip().split()[0]
         else:
-            return {"passed": False, "evidence": f"no service matches selector '{service}'"}
+            return {"passed": False, "evidence": f"没有匹配选择器 '{service}' 的 Service"}
     svc = svc.split("/")[-1]
     deadline = asyncio.get_event_loop().time() + timeout_sec
     last_ips = ""
@@ -576,13 +576,13 @@ async def _check_service_ready(kc_path: str, ns: str, service: str, timeout_sec:
                 last_ips = ips
                 if progress_cb is not None:
                     await progress_cb(f"[service_ready] {svc} endpoints: {ips}")
-            return {"passed": True, "evidence": f"service {svc} has endpoints: {ips}"}
+            return {"passed": True, "evidence": f"Service {svc} 已有端点: {ips}"}
         now = asyncio.get_event_loop().time()
         if progress_cb is not None and now - last_wait_ts >= 15:
             last_wait_ts = now
             await progress_cb(f"[service_ready] {svc} 暂无端点，等待... ({int(deadline - now)}s 剩余)")
         await asyncio.sleep(3)
-    return {"passed": False, "evidence": f"timeout after {timeout_sec}s — service {svc} no endpoints"}
+    return {"passed": False, "evidence": f"超时 {timeout_sec}s — Service {svc} 无端点"}
 
 
 async def _check_pod_log_match(kc_path: str, ns: str, target: str, substring: str, timeout_sec: int,
@@ -598,7 +598,7 @@ async def _check_pod_log_match(kc_path: str, ns: str, target: str, substring: st
             timeout=10,
         )
         if rc == 0 and substring in out:
-            return {"passed": True, "evidence": f"log contains '{substring}'"}
+            return {"passed": True, "evidence": f"日志包含 '{substring}'"}
         seen = out or ""
         if progress_cb is not None:
             # Show the FULL log tail (not just 6 lines) so the execution
@@ -613,7 +613,7 @@ async def _check_pod_log_match(kc_path: str, ns: str, target: str, substring: st
                     last_wait_ts = now
                     await progress_cb(f"[pod_log_match] 暂无日志，等待 '{substring}' 出现...")
         await asyncio.sleep(3)
-    return {"passed": False, "evidence": f"log never contained '{substring}'; tail: {seen[:200]}"}
+    return {"passed": False, "evidence": f"日志中未出现 '{substring}'; 尾部: {seen[:200]}"}
 
 
 async def _check_http_ok(kc_path: str, ns: str, url: str, expect: str, timeout_sec: int) -> dict:
@@ -628,10 +628,10 @@ async def _check_http_ok(kc_path: str, ns: str, url: str, expect: str, timeout_s
         )
         if rc == 0:
             status = expect
-            return {"passed": True, "evidence": f"http {url} -> 2xx (expect {status})"}
+            return {"passed": True, "evidence": f"HTTP {url} 返回 2xx（期望 {expect}）"}
         # pod may not have pulled yet; keep trying until timeout
         await asyncio.sleep(5)
-    return {"passed": False, "evidence": f"http {url} not reachable within {timeout_sec}s (expect {expect})"}
+    return {"passed": False, "evidence": f"HTTP {url} 在 {timeout_sec}s 内不可达（期望 {expect}）"}
 
 
 async def run_experiment(

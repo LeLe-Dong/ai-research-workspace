@@ -77,6 +77,18 @@ export function K8sExperimentPanel({ artifact }: { artifact: ArtifactOut }) {
     http_ok: "HTTP 可达",
   };
 
+  const statusText = (c: any): string => {
+    if (c.skipped) return "已跳过";
+    return c.passed ? "通过" : "失败";
+  };
+
+  const statusClass = (c: any): string => {
+    if (c.skipped) return "text-zinc-500 bg-zinc-500/10 border-zinc-500/30";
+    return c.passed
+      ? "text-emerald-600 bg-emerald-500/10 border-emerald-500/30 dark:text-emerald-300"
+      : "text-red-600 bg-red-500/10 border-red-500/30 dark:text-red-300";
+  };
+
   return (
     <div className="space-y-4 p-4">
       {/* Purpose: what this experiment verifies (goal ↔ test alignment) */}
@@ -167,24 +179,31 @@ export function K8sExperimentPanel({ artifact }: { artifact: ArtifactOut }) {
               {checks.map((c, i) => (
                 <div
                   key={i}
-                  className="rounded border px-2 py-1.5 text-xs"
-                  style={{ borderColor: c.passed ? "rgb(16 185 129 / 0.3)" : "rgb(239 68 68 / 0.3)", background: c.passed ? "rgb(16 185 129 / 0.05)" : "rgb(239 68 68 / 0.05)" }}
+                  className="rounded border px-2.5 py-2 text-xs"
+                  style={{ borderColor: c.skipped ? "rgb(113 113 122 / 0.3)" : c.passed ? "rgb(16 185 129 / 0.3)" : "rgb(239 68 68 / 0.3)", background: c.skipped ? "rgb(113 113 122 / 0.05)" : c.passed ? "rgb(16 185 129 / 0.05)" : "rgb(239 68 68 / 0.05)" }}
                 >
                   <div className="flex items-center justify-between gap-2">
                     <span className="flex min-w-0 items-center gap-1.5">
-                      <span>{c.passed ? "✅" : "❌"}</span>
+                      <span>{c.skipped ? "⏭️" : c.passed ? "✅" : "❌"}</span>
                       <span className="truncate font-medium">{c.name}</span>
                     </span>
-                    <Badge variant="outline" className="h-4 shrink-0 text-[9px]">
-                      {typeLabel[c.type] || c.type}
-                    </Badge>
+                    <span className="flex shrink-0 items-center gap-1">
+                      <Badge variant="outline" className={"h-4 px-1.5 text-[9px] " + statusClass(c)}>
+                        {statusText(c)}
+                      </Badge>
+                      <Badge variant="outline" className="h-4 shrink-0 text-[9px]">
+                        {typeLabel[c.type] || c.type}
+                      </Badge>
+                    </span>
                   </div>
-                  <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
-                    target={c.target} · expect={c.expect}
-                    {c.skipped && " · (已跳过，计划未部署该资源)"}
+                  <p className="mt-1.5 text-[10px] leading-relaxed text-muted-foreground">
+                    <span className="font-medium text-foreground/80">目标：</span>{c.target}
+                    <span className="mx-1 text-muted-foreground/40">·</span>
+                    <span className="font-medium text-foreground/80">期望：</span>{c.expect}
+                    {c.skipped && <span className="ml-1 text-zinc-500">（计划中未部署该资源，跳过）</span>}
                   </p>
                   {c.evidence && (
-                    <p className="mt-0.5 line-clamp-2 break-words text-[10px] text-muted-foreground/70">
+                    <p className="mt-1 whitespace-pre-wrap break-words rounded bg-black/5 p-1.5 text-[10px] leading-relaxed text-muted-foreground dark:bg-white/5">
                       {c.evidence}
                     </p>
                   )}
