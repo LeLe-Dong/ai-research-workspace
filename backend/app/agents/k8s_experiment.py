@@ -106,18 +106,39 @@ EXPERIMENT_SYSTEM = """你是 Kubernetes 专家，负责为一项 AI 预研课�
 
 你只输出一个 JSON 对象，不要输出任何其他文字、解释、markdown 代码块或前后缀。
 
-要求：
-- 试验必须针对该研究的**具体推荐方案**（镜像、部署方式、配置参数），而不是泛化模板。
-- 每个 workload 的 yaml 必须是完整可用的 Kubernetes 清单（Pod / Deployment / Service 等），
-  命名空间必须使用 {namespace}。
-- 镜像必须来自内网 registry：registry.adms.io:31542/library/<image>:<tag>
+## 核心原则：验证的是"功能"，不仅仅是"Pod启动"
+
+Pod 启动（pod_ready）只是最基本的前提，**不能作为主要验证手段**。
+验证方案必须覆盖研究目标中提到的关键功能点，例如：
+- 主从复制：写入主库数据，验证从库能否读取、复制状态是否健康
+- 高可用：模拟主库故障，验证切换是否发生、数据是否保留
+- 性能：运行基准测试命令，验证吞吐量、延迟、QPS 等指标
+- 缓存：验证缓存命中率、淘汰策略是否生效
+- 数据一致性：写入后立即验证读取结果
+
+【最佳实践】
+- 为需要执行命令验证的工作负载（如压测、数据写入）创建独立的 Deployment/Job，
+  其容器命令应包含具体的验证逻辑（如 redis-benchmark、mysqlslap、curl 压测等），
+  并输出可解析的结果（如 requests per second、TPS、延迟等）。
+- 使用 pod_log_match 检查这些压测/验证 Pod 的日志，匹配预期输出。
+- 对于需要验证数据写入的场景，Pod 命令应包含：写入数据 → 等待复制 → 验证读取。
+- 对于需要验证故障切换的场景，Pod 命令应包含：停止主库 → 等待从库接管 → 验证新主库可用。
+
+## 具体要求
+
+1. 试验必须针对该研究的**具体推荐方案**（镜像、部署方式、配置参数），而不是泛化模板。
+2. 每个 workload 的 yaml 必须是完整可用的 Kubernetes 清单（Pod / Deployment / Job / Service 等），
+   命名空间必须使用 {namespace}。
+3. 镜像必须来自内网 registry：registry.adms.io:31542/library/<image>:<tag>
   （例如 registry.adms.io:31542/library/redis:7.0.4，registry.adms.io:31542/library/postgres:15，
    registry.adms.io:31542/library/mysql:8.0，registry.adms.io:31542/library/mongo:8.0，
    registry.adms.io:31542/library/nginx:1.26.2-alpine，registry.adms.io:31542/library/busybox:1.0）
   ，不允许使用公网镜像。
-- 资源请求要保守（cpu ≤ 500m, memory ≤ 512Mi），避免超出集群配额。
+4. 资源请求要保守（cpu ≤ 500m, memory ≤ 512Mi），避免超出集群配额。
+5. 压测/验证 Pod 的命令必须先等待依赖服务就绪（如 until redis-cli ping / until mysqladmin ping），
+   然后执行验证逻辑并输出可解析的结果。
 
-JSON schema（严格遵循，字段名不能改）：
+## JSON schema（严格遵循，字段名不能改）
 {{
   "experiment": {{"name": str, "namespace": "{namespace}"}},
   "workloads": [
@@ -129,18 +150,24 @@ JSON schema（严格遵循，字段名不能改）：
   ]
 }}
 
-check.type 只能是以下枚举之一：
+## check.type 枚举（只能选这些）
 - pod_ready      : 目标 Pod 就绪（target 为 label 选择器，如 "app=redis"）
 - service_ready  : Service 有端点（target 为 Service 名）
-- pod_log_match  : Pod 日志包含 expect 字符串（target 为 label 选择器）
+- pod_log_match  : Pod 日志包含 expect 字符串（target 为 label 选择器）——**优先使用此类型进行功能验证**
 - http_ok        : 命名空间内 HTTP 请求返回 2xx（target 为 http://service:port/）
 
-check.expect 根据类型填写期望值（pod_ready 填 "true"；pod_log_match 填要匹配的子串；http_ok 填 "200" 或 "2xx"）。
-check.timeout_sec 给足 Pod 拉取镜像和启动的时间，默认 90。
+## check.expect 根据类型填写
+- pod_ready: 填 "true"
+- pod_log_match: 填 Pod 日志中预期出现的子串（如 "requests per second"、"OK"、"SYNCHRONIZED" 等）
+- http_ok: 填 "200" 或 "2xx"
 
-【关键约束】checks 数组中的每一项都必须引用 workloads 数组中实际存在的资源。
-如果 checks 引用了 workloads 中不存在的 app/Deployment 名称，那些断言会被跳过并标记为"计划不一致"。
-因此：1) 先确定 workloads，2) 再为每个 workload 编写对应的 checks，不要出现 checks 中的 target 在 workloads 中找不到的资源。
+## check.timeout_sec
+给足时间让压测 Pod 完成，一般 ≥ 120s。
+
+## 【关键约束】checks 一致性
+checks 数组中的每一项都必须引用 workloads 数组中实际存在的资源。
+不要出现 checks 中的 target 在 workloads 中找不到的资源。
+1) 先确定 workloads，2) 再为每个 workload 编写对应的 checks。
 """
 
 
@@ -192,22 +219,23 @@ async def _ask_hermes_for_experiment(
         "为这项研究设计可执行的K8s验证试验。\n\n"
         "【研究目标（必须围绕它设计试验）】\n" + (goal or "")[:1200] + "\n\n"
         "【研究发现/推荐方案（参考，不要偏离目标）】\n" + (recommendations_md or "")[:2000] + "\n\n"
-        "要求：\n"
-        f"0. 试验必须直接验证【研究目标】中的关键点：把目标里提到的每个可测项"
-        "（如：高可用/故障切换、主从复制、Cluster分片、持久化、ACL、性能/吞吐等）"
-        "映射为具体的工作负载和断言。不要在目标没提的方向上另起炉灶，也不要遗漏目标里的核心验证项。\n"
+        "## 核心原则：验证功能，不只是 Pod 启动\n"
+        "Pod 就绪（pod_ready）只是前提，不能作为主要验证手段。\n"
+        "必须为研究目标中的每个关键功能点生成功能验证检查：\n"
+        "- 主从复制：Pod 命令包含写入主库数据 + 从库读取验证，pod_log_match 检查复制成功标记\n"
+        "- 高可用：Pod 命令模拟故障 + 验证切换\n"
+        "- 性能：Pod 命令运行 redis-benchmark / pgbench / mysqlslap 并输出指标\n"
+        "- 数据一致性：Pod 命令写入后验证读取结果\n\n"
+        "【要求】\n"
+        f"0. 试验直接验证研究目标中的关键功能点，不只是 Pod 启动。\n"
         f"1. 命名空间必须用 {namespace}。\n"
-        "2. 镜像只能用 registry.adms.io:31542/library/<image>:<tag>（redis:7.0.4/postgres:15/"
-        "mysql:8.0/mongo:8.0/nginx:1.26.2-alpine/busybox:1.0）。\n"
-        "3. Deployment 不要写 restartPolicy；labels 用 app=<名>；checks target 用 app=<名>。\n"
-        "4. 压测容器命令必须先 until 等待依赖就绪再压测，输出含 'requests per second' 或 'ops'。"
-        "等待命令写法示例：until redis-cli -h redis-cache ping 2>/dev/null | grep -q PONG; do sleep 1; done"
-        "（redis-cli 没有 -t 参数，不要用 redis-cli -t）。\n"
-        "5. 使用 mysql 镜像时，容器必须设置 MYSQL_ROOT_PASSWORD（或 MYSQL_ALLOW_EMPTY_PASSWORD=yes），"
-        "否则 mysql 8 容器无法完成初始化；mysql 默认数据目录是 /var/lib/mysql。\n"
+        "2. 镜像用 registry.adms.io:31542/library/<image>:<tag>。\n"
+        "3. Deployment 不写 restartPolicy；labels 用 app=<名>。\n"
+        "4. 压测/验证 Pod 命令先 until 等待依赖就绪再执行，输出可解析结果。\n"
+        "5. mysql 容器需设置 MYSQL_ROOT_PASSWORD=yes 或 MYSQL_ALLOW_EMPTY_PASSWORD=yes。\n"
         "6. 资源请求 cpu<=500m, memory<=512Mi。\n"
-        "7. 一个 workload 的 yaml 只放一个资源（多资源就放多个 workload 条目）。\n"
-        "8. 试验的 checks 必须与 workloads 一一对应，不要引用未部署的资源。\n\n"
+        "7. checks 必须与 workloads 一一对应，不要引用未部署的资源。\n"
+        "8. 优先用 pod_log_match 进行功能验证（匹配 Pod 输出中的关键结果），pod_ready 仅作辅助。\n\n"
         "JSON格式：\n"
         "{\"experiment\":{\"name\":\"x\",\"namespace\":\"" + namespace + "\"},"
         "\"workloads\":[{\"name\":\"x\",\"kind\":\"Deployment\",\"image\":\"registry.adms.io:31542/library/redis:7.0.4\",\"replicas\":1,\"yaml\":\"...\"}],"
