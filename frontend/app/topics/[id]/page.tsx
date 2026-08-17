@@ -2,7 +2,7 @@
 import { useParams, useRouter } from "next/navigation";
 import { useState } from "react";
 import Link from "next/link";
-import { useTopic, useIterateTopic } from "@/features/topics/hooks";
+import { useTopic, useIterateTopic, type TopicSession } from "@/features/topics/hooks";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -85,6 +85,13 @@ export default function TopicDetailPage() {
       </div>
 
       <div className="grid gap-6 lg:grid-cols-[1fr_340px]">
+        {/* Baseline overview */}
+        {sessions.length > 0 && (
+          <div className="lg:col-span-2 mb-2">
+            <BaselineOverview data={data} sessions={sessions} />
+          </div>
+        )}
+
         {/* Iteration timeline */}
         <div className="relative space-y-4">
           {sessions.length === 0 && (
@@ -271,5 +278,106 @@ export default function TopicDetailPage() {
         </aside>
       </div>
     </div>
+  );
+}
+
+/** 基线概览：第1轮为基线，展示评分趋势、相对基线的变化、平均分等指标。 */
+function BaselineOverview({ data, sessions }: { data: any; sessions: TopicSession[] }) {
+  const trend = data.score_trend as (number | null)[];
+  const baselineScore = data.baseline?.score;
+  const latestScore = data.latest_score;
+  const delta = data.delta_from_baseline;
+  const improved = data.improved;
+  const avgScore = data.avg_score;
+  const bestIter = data.best_iteration;
+  const bestScore = data.best_score;
+
+  const maxScore = Math.max(10, ...(trend.filter((s): s is number => s != null)));
+
+  return (
+    <Card className="border-blue-500/20">
+      <CardContent className="p-4">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          {/* Left: key metrics */}
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <GitBranch className="h-4 w-4 text-blue-500" />
+              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                基线概览
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-3">
+              <div className="rounded border bg-muted/40 px-3 py-1.5">
+                <p className="text-[10px] text-muted-foreground">基线评分（第1轮）</p>
+                <p className="font-bold">{baselineScore != null ? baselineScore.toFixed(1) : "—"}</p>
+              </div>
+              <div className="rounded border bg-muted/40 px-3 py-1.5">
+                <p className="text-[10px] text-muted-foreground">最新评分</p>
+                <p className="font-bold">{latestScore != null ? latestScore.toFixed(1) : "—"}</p>
+              </div>
+              <div className="rounded border px-3 py-1.5"
+                   style={{ borderColor: improved ? "rgb(16 185 129 / 0.4)" : "rgb(245 158 11 / 0.4)",
+                            background: improved ? "rgb(16 185 129 / 0.05)" : "rgb(245 158 11 / 0.05)" }}>
+                <p className="text-[10px] text-muted-foreground">相对基线变化</p>
+                <p className={"font-bold " + (improved ? "text-emerald-500" : delta != null && delta < 0 ? "text-amber-500" : "")}>
+                  {delta == null ? "—" : `${delta > 0 ? "+" : ""}${delta.toFixed(1)}${improved ? " ↑" : delta < 0 ? " ↓" : ""}`}
+                </p>
+              </div>
+              <div className="rounded border bg-muted/40 px-3 py-1.5">
+                <p className="text-[10px] text-muted-foreground">平均分</p>
+                <p className="font-bold">{avgScore != null ? avgScore.toFixed(1) : "—"}</p>
+              </div>
+              <div className="rounded border bg-muted/40 px-3 py-1.5">
+                <p className="text-[10px] text-muted-foreground">最佳轮次</p>
+                <p className="font-bold">{bestIter != null ? `第 ${bestIter} 轮` : "—"}
+                  {bestScore != null && <span className="ml-1 text-[10px] font-normal text-muted-foreground">({bestScore.toFixed(1)})</span>}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Right: score trend chart */}
+          <div className="min-w-[220px] flex-1">
+            <p className="mb-1 text-[10px] font-medium text-muted-foreground">评分趋势（各轮 vs 基线）</p>
+            <div className="flex h-24 items-end gap-1.5">
+              {trend.map((s, i) => {
+                const v = s as number | null;
+                const isBaseline = i === 0;
+                const h = v != null ? Math.max(6, (v / maxScore) * 100) : 4;
+                return (
+                  <div key={i} className="flex flex-1 flex-col items-center gap-1">
+                    <div className="flex w-full flex-1 items-end">
+                      <div
+                        className="w-full rounded-t"
+                        style={{
+                          height: `${h}%`,
+                          background: v == null
+                            ? "rgb(113 113 122 / 0.2)"
+                            : isBaseline
+                              ? "rgb(59 130 246 / 0.8)"
+                              : v >= 8
+                                ? "rgb(16 185 129 / 0.8)"
+                                : v >= 6
+                                  ? "rgb(245 158 11 / 0.8)"
+                                  : "rgb(239 68 68 / 0.8)",
+                        }}
+                      />
+                    </div>
+                    <span className="text-[9px] text-muted-foreground">第{i + 1}轮</span>
+                    {v != null && <span className="text-[9px] font-medium tabular-nums">{v.toFixed(1)}</span>}
+                  </div>
+                );
+              })}
+            </div>
+            {baselineScore != null && (
+              <p className="mt-1 text-[9px] text-muted-foreground">
+                <span className="mr-2 inline-block h-2 w-2 rounded-sm bg-blue-500/80" />
+                第1轮为基线，后续轮次与之对比
+              </p>
+            )}
+          </div>
+        </div>
+      </CardContent>
+    </Card>
   );
 }

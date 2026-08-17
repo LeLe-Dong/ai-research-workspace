@@ -47,6 +47,25 @@ class IterateRequest(BaseModel):
 def _topic_out(t: ResearchTopic, sessions: list[dict]) -> dict:
     completed = sum(1 for s in sessions if s["status"] == "completed")
     latest = sessions[-1] if sessions else None
+
+    # Baseline metrics — the first round is the reference point; later
+    # iterations are judged against it.
+    baseline_score = None
+    baseline_goal = ""
+    if sessions:
+        first = sessions[0]
+        baseline_score = first.get("score")
+        baseline_goal = first.get("goal") or ""
+
+    scored = [s for s in sessions if s.get("score") is not None]
+    avg_score = round(sum(s["score"] for s in scored) / len(scored), 2) if scored else None
+    best = max(scored, key=lambda s: s["score"]) if scored else None
+    score_trend = [s.get("score") for s in sessions]  # per-iteration scores
+    latest_score = latest.get("score") if latest else None
+    delta_from_baseline = None
+    if latest_score is not None and baseline_score is not None:
+        delta_from_baseline = round(latest_score - baseline_score, 2)
+
     return {
         "id": t.id,
         "name": t.name,
@@ -54,8 +73,20 @@ def _topic_out(t: ResearchTopic, sessions: list[dict]) -> dict:
         "iteration_count": len(sessions),
         "completed_count": completed,
         "latest_status": (latest or {}).get("status"),
-        "latest_score": (latest or {}).get("score"),
+        "latest_score": latest_score,
         "latest_title": (latest or {}).get("title"),
+        # Baseline & trend
+        "baseline": {
+            "score": baseline_score,
+            "goal": baseline_goal[:200],
+            "iteration": 1,
+        },
+        "score_trend": score_trend,
+        "avg_score": avg_score,
+        "best_iteration": best.get("iteration") if best else None,
+        "best_score": best.get("score") if best else None,
+        "delta_from_baseline": delta_from_baseline,
+        "improved": (delta_from_baseline or 0) > 0,
         "created_at": t.created_at.isoformat(),
         "updated_at": t.updated_at.isoformat(),
     }
@@ -165,8 +196,15 @@ async def get_topic(topic_id: str, session: AsyncSession = Depends(get_session_d
     sessions = []
     for r in rs:
         sessions.append(await _research_out(session, r))
-    return {"id": t.id, "name": t.name, "description": t.description,
-            "sessions": sessions, "total": len(sessions)}
+    return {
+        "id": t.id,
+        "name": t.name,
+        "description": t.description,
+        "sessions": sessions,
+        "total": len(sessions),
+        # baseline + trend (same computation as _topic_out)
+        **_topic_out(t, sessions),
+    }
 
 
 @router.delete("/{topic_id}", status_code=204)

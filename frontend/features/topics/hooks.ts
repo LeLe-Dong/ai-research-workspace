@@ -28,6 +28,17 @@ export interface TopicItem {
   latest_status: string | null;
   latest_score: number | null;
   latest_title: string | null;
+  baseline: {
+    score: number | null;
+    goal: string;
+    iteration: number;
+  };
+  score_trend: (number | null)[];
+  avg_score: number | null;
+  best_iteration: number | null;
+  best_score: number | null;
+  delta_from_baseline: number | null;
+  improved: boolean;
   created_at: string;
   updated_at: string;
 }

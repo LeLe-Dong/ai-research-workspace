@@ -121,8 +121,26 @@ export default function TopicsPage() {
                         <CheckCircle2 className="h-3 w-3 text-emerald-500" />
                         {t.completed_count} 轮完成
                       </span>
-                      {t.latest_score != null && (
-                        <span>最新评分 <strong className="text-amber-500">{t.latest_score}</strong></span>
+                      {t.avg_score != null && (
+                        <span>平均分 <strong className="text-amber-500">{t.avg_score.toFixed(1)}</strong></span>
+                      )}
+                      {t.delta_from_baseline != null && (
+                        <span className={t.improved ? "text-emerald-500" : t.delta_from_baseline < 0 ? "text-amber-500" : ""}>
+                          {t.improved ? "较基线 +" + t.delta_from_baseline.toFixed(1) + " ↑" : t.delta_from_baseline < 0 ? "较基线 " + t.delta_from_baseline.toFixed(1) + " ↓" : "与基线持平"}
+                        </span>
+                      )}
+                      {t.score_trend && t.score_trend.length > 1 && (
+                        <span className="flex items-center gap-0.5">
+                          {t.score_trend.map((s, i) => (
+                            <span key={i} className="inline-block h-2.5 w-1 rounded-sm"
+                              style={{
+                                background: s == null ? "rgb(113 113 122 / 0.2)"
+                                  : s >= 8 ? "rgb(16 185 129 / 0.8)"
+                                  : s >= 6 ? "rgb(245 158 11 / 0.8)"
+                                  : "rgb(239 68 68 / 0.8)",
+                              }} />
+                          ))}
+                        </span>
                       )}
                     </div>
                   </div>
