@@ -61,7 +61,49 @@ def _topic_out(t: ResearchTopic, sessions: list[dict]) -> dict:
     }
 
 
-def _research_out(r: Research) -> dict:
+async def _research_out(session: AsyncSession, r: Research) -> dict:
+    """Build a research summary for a topic timeline, including the review
+    score, a report excerpt, and a k8s-experiment result summary so the UI
+    can show what each iteration concluded and measured."""
+    score = None
+    report_excerpt = ""
+    k8s_summary = ""
+
+    # Review score
+    from app.db.models import Review
+    rev = (await session.execute(
+        select(Review).where(Review.research_id == r.id)
+    )).scalar_one_or_none()
+    if rev is not None:
+        score = rev.overall_score
+
+    # Report excerpt (markdown artifact)
+    from app.db.models import Artifact
+    md = (await session.execute(
+        select(Artifact).where(
+            Artifact.research_id == r.id, Artifact.kind == "markdown"
+        ).order_by(Artifact.id.desc()).limit(1)
+    )).scalar_one_or_none()
+    if md is not None:
+        report_excerpt = (md.content or "").strip()[:300]
+
+    # k8s experiment result summary
+    exp = (await session.execute(
+        select(Artifact).where(
+            Artifact.research_id == r.id, Artifact.kind == "k8s-experiment"
+        ).order_by(Artifact.id.desc()).limit(1)
+    )).scalar_one_or_none()
+    if exp is not None:
+        try:
+            import json as _json
+            d = _json.loads(exp.content)
+            k8s_summary = (
+                f"实测: {d.get('passed', 0)}/{d.get('actual_total', d.get('total', 0))} "
+                f"断言通过" + (f"（{d.get('skipped', 0)} 跳过）" if d.get('skipped') else "")
+            )
+        except Exception:
+            k8s_summary = ""
+
     return {
         "id": r.id,
         "iteration": r.iteration,
@@ -72,7 +114,9 @@ def _research_out(r: Research) -> dict:
         "depth": r.depth,
         "priority": r.priority,
         "status": r.status,
-        "score": getattr(r, "score", None) if hasattr(r, "score") else None,
+        "score": score,
+        "report_excerpt": report_excerpt,
+        "k8s_summary": k8s_summary,
         "created_at": r.created_at.isoformat(),
         "updated_at": r.updated_at.isoformat(),
     }
@@ -94,7 +138,9 @@ async def list_topics(session: AsyncSession = Depends(get_session_dep)):
     out = []
     for t in topics:
         rs = await _load_topic_sessions(session, t.id)
-        sessions = [_research_out(r) for r in rs]
+        sessions = []
+        for r in rs:
+            sessions.append(await _research_out(session, r))
         out.append(_topic_out(t, sessions))
     return {"items": out, "total": len(out)}
 
@@ -116,7 +162,9 @@ async def get_topic(topic_id: str, session: AsyncSession = Depends(get_session_d
     if not t:
         raise HTTPException(404, "topic not found")
     rs = await _load_topic_sessions(session, topic_id)
-    sessions = [_research_out(r) for r in rs]
+    sessions = []
+    for r in rs:
+        sessions.append(await _research_out(session, r))
     return {"id": t.id, "name": t.name, "description": t.description,
             "sessions": sessions, "total": len(sessions)}
 
@@ -196,4 +244,4 @@ async def iterate_topic(
     )
     await session.commit()
     await session.refresh(new_r)
-    return _research_out(new_r)
+    return await _research_out(session, new_r)

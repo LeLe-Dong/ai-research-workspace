@@ -9,7 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
-  GitBranch, ArrowRight, ArrowUpRight, Play, History, Loader2, Target, MessageSquare,
+  GitBranch, ArrowRight, ArrowUpRight, Play, History, Loader2, Target, MessageSquare, Server, Sparkles,
 } from "lucide-react";
 
 const statusLabel: Record<string, string> = {
@@ -101,7 +101,7 @@ export default function TopicDetailPage() {
               </div>
               <Card className="flex-1 p-4">
                 <div className="flex items-start justify-between gap-4">
-                  <div className="flex-1 space-y-1.5">
+                  <div className="flex-1 space-y-2">
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="font-medium">第 {s.iteration} 轮</span>
                       <Badge variant={s.status === "completed" ? "success" : "secondary"}>
@@ -110,11 +110,33 @@ export default function TopicDetailPage() {
                       {idx === sessions.length - 1 && (
                         <Badge variant="info" className="text-xs">最新</Badge>
                       )}
+                      {s.score != null && (
+                        <Badge variant={s.score >= 8 ? "success" : s.score >= 6 ? "warning" : "destructive"}
+                          className="h-5 px-2 text-xs">
+                          评分 {s.score.toFixed(1)}
+                        </Badge>
+                      )}
                     </div>
                     <p className="text-sm">{s.title}</p>
                     <p className="text-xs text-muted-foreground line-clamp-2">目标：{s.goal}</p>
                     {s.constraints && (
                       <p className="text-xs text-muted-foreground/80 line-clamp-1">约束：{s.constraints}</p>
+                    )}
+                    {s.k8s_summary && (
+                      <p className="text-xs text-cyan-600 dark:text-cyan-300">
+                        <Server className="mr-1 inline h-3 w-3" />
+                        {s.k8s_summary}
+                      </p>
+                    )}
+                    {s.report_excerpt && (
+                      <details className="mt-1 rounded border bg-muted/30 p-2">
+                        <summary className="cursor-pointer text-[10px] font-medium text-muted-foreground">
+                          报告摘要
+                        </summary>
+                        <p className="mt-1 whitespace-pre-wrap break-words text-[10px] leading-relaxed text-muted-foreground">
+                          {s.report_excerpt.length > 500 ? s.report_excerpt.slice(0, 500) + "…" : s.report_excerpt}
+                        </p>
+                      </details>
                     )}
                     <p className="text-xs text-muted-foreground">{new Date(s.created_at).toLocaleString()}</p>
                   </div>
@@ -152,6 +174,22 @@ export default function TopicDetailPage() {
                         ? "填写本轮研究目标（可留空，将基于主题名自动生成）"
                         : "留空则继承上一轮的边界；填写则覆盖。"}
                     </p>
+                    {latest && (
+                      <div className="rounded border bg-muted/30 p-2.5 text-[11px] leading-relaxed text-muted-foreground">
+                        <p className="flex items-center gap-1 font-medium text-foreground/80">
+                          <Sparkles className="h-3 w-3 text-amber-500" />
+                          上一轮（第 {latest.iteration} 轮）参考
+                        </p>
+                        <p className="mt-1">
+                          {latest.score != null && <>评分：<strong>{latest.score.toFixed(1)}</strong> · </>}
+                          状态：{statusLabel[latest.status] || latest.status}
+                          {latest.k8s_summary && <> · {latest.k8s_summary}</>}
+                        </p>
+                        {latest.report_excerpt && (
+                          <p className="mt-1 line-clamp-2">{latest.report_excerpt.slice(0, 200)}</p>
+                        )}
+                      </div>
+                    )}
                     <div className="space-y-1.5">
                       <label className="text-xs text-muted-foreground">研究目标</label>
                       <Textarea value={nextGoal} onChange={(e) => setNextGoal(e.target.value)} rows={3}
@@ -211,6 +249,16 @@ export default function TopicDetailPage() {
                 </div>
                 <div className="flex justify-between"><span className="text-muted-foreground">深度</span><span>{latest.depth}</span></div>
                 <div className="flex justify-between"><span className="text-muted-foreground">优先级</span><span>{latest.priority}</span></div>
+                {latest.score != null && (
+                  <div className="flex justify-between"><span className="text-muted-foreground">评分</span>
+                    <Badge variant={latest.score >= 8 ? "success" : latest.score >= 6 ? "warning" : "destructive"}>{latest.score.toFixed(1)}</Badge>
+                  </div>
+                )}
+                {latest.k8s_summary && (
+                  <div className="rounded border border-cyan-500/30 bg-cyan-500/5 p-2">
+                    <p className="text-[10px] text-cyan-600 dark:text-cyan-300">{latest.k8s_summary}</p>
+                  </div>
+                )}
                 <Button asChild variant="outline" size="sm" className="w-full mt-2">
                   <Link href={`/research/${latest.id}`}>
                     <ArrowRight className="mr-1.5 h-3.5 w-3.5" />

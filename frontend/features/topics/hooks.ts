@@ -12,6 +12,9 @@ export interface TopicSession {
   depth: string;
   priority: string;
   status: string;
+  score: number | null;
+  report_excerpt: string;
+  k8s_summary: string;
   created_at: string;
   updated_at: string;
 }
