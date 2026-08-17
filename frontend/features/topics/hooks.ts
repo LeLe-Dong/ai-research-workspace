@@ -11,10 +11,12 @@ export interface TopicSession {
   expected_output: string;
   depth: string;
   priority: string;
+  requires_k8s_validation: number;
   status: string;
   score: number | null;
   report_excerpt: string;
   k8s_summary: string;
+  prev_iteration_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -95,27 +97,33 @@ export function useIterateTopic() {
   return useMutation({
     mutationFn: async ({
       topicId,
+      title,
       goal,
       constraints,
       expected_output,
       depth,
       priority,
+      requires_k8s_validation,
       commit_message,
     }: {
       topicId: string;
+      title?: string;
       goal?: string;
       constraints?: string;
       expected_output?: string;
       depth?: string;
       priority?: string;
+      requires_k8s_validation?: number;
       commit_message?: string;
     }) => {
       return api.post<TopicSession>(`/api/v1/topics/${topicId}/iterate`, {
+        title,
         goal,
         constraints,
         expected_output,
         depth,
         priority,
+        requires_k8s_validation,
         commit_message,
       });
     },

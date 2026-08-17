@@ -42,6 +42,9 @@ class Research(Base):
     # standalone researches.
     topic_id: Mapped[str | None] = mapped_column(String(12), ForeignKey("research_topics.id"), nullable=True, index=True)
     iteration: Mapped[int] = mapped_column(Integer, default=1)  # 1-based round within its topic
+    # Reference to the iteration this round was launched from (for traceable
+    # "based on round N, adjusted X" iteration chains).
+    prev_iteration_id: Mapped[str | None] = mapped_column(String(12), nullable=True, index=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

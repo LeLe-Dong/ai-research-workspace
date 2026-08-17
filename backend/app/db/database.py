@@ -120,6 +120,10 @@ async def init_db() -> None:
             await conn.execute(text(
                 "ALTER TABLE researches ADD COLUMN iteration INTEGER DEFAULT 1"
             ))
+        if 'prev_iteration_id' not in r_col_names:
+            await conn.execute(text(
+                "ALTER TABLE researches ADD COLUMN prev_iteration_id VARCHAR(12)"
+            ))
         await conn.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_researches_topic_id ON researches(topic_id)"
         ))

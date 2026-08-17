@@ -35,12 +35,19 @@ class IterateRequest(BaseModel):
     """Boundary adjustments for the next iteration.
 
     All optional: unset fields are carried forward from the latest round.
+    Only what the user explicitly adjusts is changed — the rest inherits
+    from the previous iteration, so a human can fine-tune the research
+    specification (规范/目标) round after round based on prior results.
     """
+    title: str | None = None
     goal: str | None = None
     constraints: str | None = None
     expected_output: str | None = None
     depth: str | None = None
     priority: str | None = None
+    requires_k8s_validation: int | None = None  # -1=off, 0=auto, 1=on
+    use_custom_style: int | None = None
+    style_id: str | None = None
     commit_message: str = ""  # what changed this round / why
 
 
@@ -144,10 +151,12 @@ async def _research_out(session: AsyncSession, r: Research) -> dict:
         "expected_output": r.expected_output,
         "depth": r.depth,
         "priority": r.priority,
+        "requires_k8s_validation": r.requires_k8s_validation,
         "status": r.status,
         "score": score,
         "report_excerpt": report_excerpt,
         "k8s_summary": k8s_summary,
+        "prev_iteration_id": r.prev_iteration_id,
         "created_at": r.created_at.isoformat(),
         "updated_at": r.updated_at.isoformat(),
     }
@@ -245,9 +254,7 @@ async def iterate_topic(
 
     # Build the new round's boundary from the latest + overrides.
     base = latest
-    title = (latest.title if latest else t.name)
-    if latest is not None and not body.goal and body.commit_message:
-        pass  # keep base boundary
+    title = body.title or (latest.title if latest else t.name)
 
     # First round of a fresh topic: if no goal was supplied, derive a usable
     # one from the topic name so the research is immediately executable.
@@ -263,11 +270,14 @@ async def iterate_topic(
         depth=body.depth or (base.depth if base else "standard"),
         priority=body.priority or (base.priority if base else "medium"),
         estimated_cost=base.estimated_cost if base else 0.0,
-        requires_k8s_validation=base.requires_k8s_validation if base else 0,
-        use_custom_style=base.use_custom_style if base else 0,
-        style_id=base.style_id if base else None,
+        requires_k8s_validation=body.requires_k8s_validation if body.requires_k8s_validation is not None
+            else (base.requires_k8s_validation if base else 0),
+        use_custom_style=body.use_custom_style if body.use_custom_style is not None
+            else (base.use_custom_style if base else 0),
+        style_id=body.style_id if body.style_id is not None else (base.style_id if base else None),
         topic_id=t.id,
         iteration=(latest.iteration + 1) if latest else 1,
+        prev_iteration_id=latest.id if latest else None,
         status="pending",
     )
     session.add(new_r)

@@ -26,9 +26,11 @@ export default function TopicDetailPage() {
   const { data, isLoading } = useTopic(topicId);
   const iterate = useIterateTopic();
 
+  const [nextTitle, setNextTitle] = useState("");
   const [nextGoal, setNextGoal] = useState("");
   const [nextConstraints, setNextConstraints] = useState("");
   const [nextOutput, setNextOutput] = useState("");
+  const [nextK8s, setNextK8s] = useState<number | null>(null);
   const [commitMsg, setCommitMsg] = useState("");
   const [iterOpen, setIterOpen] = useState(false);
 
@@ -40,15 +42,19 @@ export default function TopicDetailPage() {
     try {
       await iterate.mutateAsync({
         topicId,
+        title: nextTitle || undefined,
         goal: nextGoal || undefined,
         constraints: nextConstraints || undefined,
         expected_output: nextOutput || undefined,
+        requires_k8s_validation: nextK8s ?? undefined,
         commit_message: commitMsg,
       });
       setIterOpen(false);
+      setNextTitle("");
       setNextGoal("");
       setNextConstraints("");
       setNextOutput("");
+      setNextK8s(null);
       setCommitMsg("");
       router.refresh();
     } catch {
@@ -179,7 +185,7 @@ export default function TopicDetailPage() {
                     <p className="text-xs text-muted-foreground">
                       {isFirstRound
                         ? "填写本轮研究目标（可留空，将基于主题名自动生成）"
-                        : "留空则继承上一轮的边界；填写则覆盖。"}
+                        : "可基于上一轮结果调整研究规范与目标：留空字段继承上一轮，填写则覆盖。"}
                     </p>
                     {latest && (
                       <div className="rounded border bg-muted/30 p-2.5 text-[11px] leading-relaxed text-muted-foreground">
@@ -198,12 +204,40 @@ export default function TopicDetailPage() {
                       </div>
                     )}
                     <div className="space-y-1.5">
-                      <label className="text-xs text-muted-foreground">研究目标</label>
+                      <label className="text-xs text-muted-foreground">本轮标题（可覆盖）</label>
+                      <Input value={nextTitle} onChange={(e) => setNextTitle(e.target.value)}
+                        placeholder={latest?.title || data.name} />
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="text-xs text-muted-foreground">研究目标（可覆盖）</label>
                       <Textarea value={nextGoal} onChange={(e) => setNextGoal(e.target.value)} rows={3}
                         placeholder={isFirstRound ? `对「${data.name}」进行系统性预研...` : latest?.goal} />
                     </div>
                     <div className="space-y-1.5">
-                      <label className="text-xs text-muted-foreground">约束条件</label>
+                      <label className="text-xs text-muted-foreground">K8s 环境验证</label>
+                      <div className="flex items-center gap-2">
+                        {[
+                          { v: -1, label: "关闭", desc: "不进行集群实测" },
+                          { v: 0, label: "自动", desc: "按目标自动判断" },
+                          { v: 1, label: "开启", desc: "强制集群实测" },
+                        ].map((o) => (
+                          <button key={o.v} type="button"
+                            onClick={() => setNextK8s(nextK8s === o.v ? null : o.v)}
+                            title={o.desc}
+                            className={"rounded border px-2 py-1 text-[11px] transition-colors " +
+                              (nextK8s === o.v
+                                ? "border-primary bg-primary/10 text-foreground"
+                                : "border-border bg-background text-muted-foreground hover:bg-muted")}>
+                            {o.label}
+                          </button>
+                        ))}
+                        <span className="text-[10px] text-muted-foreground/70">
+                          当前：{latest?.requires_k8s_validation === 1 ? "开启" : latest?.requires_k8s_validation === -1 ? "关闭" : "自动"}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="text-xs text-muted-foreground">约束条件（可覆盖）</label>
                       <Textarea value={nextConstraints} onChange={(e) => setNextConstraints(e.target.value)} rows={2}
                         placeholder={latest?.constraints || "（无）"} />
                     </div>
