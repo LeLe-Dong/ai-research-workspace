@@ -51,8 +51,8 @@ logger = logging.getLogger(__name__)
 ALLOWED_CHECK_TYPES = ("pod_ready", "service_ready", "pod_log_match", "http_ok")
 
 # Hard cap so a misbehaving LLM can't make us apply 50 resources.
-MAX_WORKLOADS = 6
-MAX_CHECKS = 10
+MAX_WORKLOADS = 10
+MAX_CHECKS = 15
 
 
 def _to_short_ref(image: str) -> str:
@@ -137,6 +137,10 @@ check.type 只能是以下枚举之一：
 
 check.expect 根据类型填写期望值（pod_ready 填 "true"；pod_log_match 填要匹配的子串；http_ok 填 "200" 或 "2xx"）。
 check.timeout_sec 给足 Pod 拉取镜像和启动的时间，默认 90。
+
+【关键约束】checks 数组中的每一项都必须引用 workloads 数组中实际存在的资源。
+如果 checks 引用了 workloads 中不存在的 app/Deployment 名称，那些断言会被跳过并标记为"计划不一致"。
+因此：1) 先确定 workloads，2) 再为每个 workload 编写对应的 checks，不要出现 checks 中的 target 在 workloads 中找不到的资源。
 """
 
 
@@ -813,10 +817,20 @@ async def run_experiment(
             )
 
         passed = sum(1 for c in results["checks"] if c.get("passed"))
+        skipped = sum(1 for c in results["checks"] if c.get("_skipped"))
         total = len(results["checks"])
-        yield AgentEvent(phase="validate", level="success" if total and passed == total else "warn",
-                         title=f"试验完成: {passed}/{total} 断言通过",
-                         detail=f"工作负载 {len(results['applied'])} 个 · 断言 {passed}/{total} · 命名空间 {ns}",
+        actual_total = total - skipped
+        if actual_total > 0:
+            status_level = "success" if passed == actual_total else "warn"
+            status_text = f"试验完成: {passed}/{actual_total} 断言通过"
+            if skipped:
+                status_text += f"（另有 {skipped} 项因计划不一致被跳过）"
+        else:
+            status_level = "warn"
+            status_text = f"试验完成: 所有 {total} 项断言均被跳过（计划不一致）"
+        yield AgentEvent(phase="validate", level=status_level,
+                         title=status_text,
+                         detail=f"工作负载 {len(results['applied'])} 个 · 断言 {passed}/{actual_total}（跳过 {skipped}） · 命名空间 {ns}",
                          task_id="task-10", task_progress=95)
 
         # 5. Persist artifact
@@ -857,6 +871,8 @@ async def run_experiment(
             "checks": checks_with_explain,
             "passed": passed,
             "total": total,
+            "skipped": skipped,
+            "actual_total": actual_total,
         }
         yield AgentEvent(phase="validate", level="info", title="试验结果已保存",
                          detail="k8s 实测结果已保存为 artifact", task_id="task-10",
@@ -916,6 +932,13 @@ def append_empirical_section(report_md: str, research_id: str) -> str:
                 checks = d.get("checks") or []
                 passed = d.get("passed", 0)
                 total = d.get("total", 0)
+                skipped = d.get("skipped")
+                if skipped is None:
+                    # Compute from checks data for older artifacts.
+                    skipped = sum(1 for c in checks if c.get("_skipped") or c.get("skipped"))
+                actual_total = d.get("actual_total")
+                if actual_total is None:
+                    actual_total = total - skipped
                 applied = d.get("workloads") or []
                 purpose = d.get("purpose") or ""
                 goal = d.get("goal") or ""
@@ -959,7 +982,9 @@ def append_empirical_section(report_md: str, research_id: str) -> str:
                     f"### 试验概览\n\n"
                     f"- **试验**: {wl}\n"
                     f"- **集群**: {d.get('cluster', '?')} · 隔离命名空间 `{d.get('namespace', '?')}`\n"
-                    f"- **断言通过率**: **{passed}/{total}**\n\n"
+                    f"- **断言通过率**: **{passed}/{actual_total}**"
+                    + (f"（另有 {skipped} 项因计划不一致被跳过）" if skipped else "")
+                    + "\n\n"
                     f"### 部署的工作负载与执行的命令\n\n{wl_block}\n\n"
                     f"### 逐项验证结果（验证点 / 步骤 / 命令 / 原因）\n\n{detail_block}\n"
                 )
