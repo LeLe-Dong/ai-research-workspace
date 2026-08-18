@@ -61,6 +61,68 @@ def _to_short_ref(image: str) -> str:
     return _to_short_name(image)
 
 
+def _resolve_mysql_image(workloads: list[dict]) -> str:
+    """Find the MySQL image used in existing workloads, or fallback to a known image."""
+    for w in workloads:
+        img = str(w.get("image", "")).lower()
+        if "mysql" in img:
+            return w.get("image", "")
+    return "registry.adms.io:31542/library/mysql:8.0"
+
+
+def _make_mysql_workload(name: str, app_label: str, namespace: str, image: str) -> str:
+    """Generate a minimal MySQL 8.0 Deployment + Service manifest for auto-provisioning.
+
+    This is used when the LLM plan has checks referencing resources that
+    were never deployed. We create a simple MySQL Deployment so the checks
+    have something to verify (at minimum pod_ready; the actual replication
+    config may still be incomplete, but at least the pod runs).
+    """
+    dep = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": name, "namespace": namespace, "labels": {"app": app_label}},
+        "spec": {
+            "replicas": 1,
+            "selector": {"matchLabels": {"app": app_label}},
+            "template": {
+                "metadata": {"labels": {"app": app_label}},
+                "spec": {
+                    "restartPolicy": "Always",
+                    "containers": [{
+                        "name": "mysql",
+                        "image": image,
+                        "ports": [{"containerPort": 3306, "name": "mysql"}],
+                        "env": [
+                            {"name": "MYSQL_ROOT_PASSWORD", "value": "airwtest123"},
+                            {"name": "MYSQL_DATABASE", "value": "testdb"},
+                        ],
+                        "command": ["/bin/sh", "-c"],
+                        "args": ["mysqld --server-id=$((RANDOM+1)) --log-bin=mysql-bin --binlog_format=ROW --gtid_mode=ON --enforce-gtid-consistency=ON --read_only=OFF --default-authentication-plugin=mysql_native_password"],
+                        "resources": {"requests": {"cpu": "200m", "memory": "256Mi"},
+                                       "limits": {"cpu": "500m", "memory": "512Mi"}},
+                        "readinessProbe": {
+                            "exec": {"command": ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-pairwtest123"]},
+                            "initialDelaySeconds": 30, "periodSeconds": 10, "timeoutSeconds": 5,
+                        },
+                    }],
+                },
+            },
+        },
+    }
+    svc = {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": name, "namespace": namespace, "labels": {"app": app_label}},
+        "spec": {
+            "selector": {"app": app_label},
+            "ports": [{"port": 3306, "targetPort": 3306, "name": "mysql"}],
+            "type": "ClusterIP",
+        },
+    }
+    return yaml.safe_dump(dep) + "\n---\n" + yaml.safe_dump(svc)
+
+
 def _default_llm() -> StepfunClient | None:
     """Build an OpenAI-compatible client for experiment planning.
 
@@ -388,6 +450,53 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
                         deployed_apps.add(str(v).lower())
         except Exception:
             pass
+
+    # ──────────────────────────────────────────────────────────────────
+    # Auto-generate workloads for checks that reference non-deployed
+    # resources.  When the LLM generates a check (e.g. pod_log_match
+    # for app=mysql-primary) but forgot to include a matching workload,
+    # we auto-create a minimal Deployment+Service so the check has
+    # something to actually verify.
+    # ──────────────────────────────────────────────────────────────────
+    check_targets: set[str] = set()
+    for c in checks:
+        if not isinstance(c, dict):
+            continue
+        target = str(c.get("target", ""))[:200].strip()
+        ref = target.split("/")[-1].lower()
+        if ref.startswith("app="):
+            ref = ref[4:]
+        ref = ref.strip()
+        if ref:
+            check_targets.add(ref)
+
+    auto_generated: list[dict] = []
+    for label in check_targets:
+        # Skip if already deployed (by workload name or app label)
+        if label in deployed_names or label in deployed_apps:
+            continue
+        # Also skip if the label is a substring of any deployed name
+        if any(label in n for n in deployed_names):
+            continue
+        # Auto-generate a simple MySQL 8.0 Deployment + Service
+        mysql_image = _resolve_mysql_image(cleaned_workloads)
+        wl_name = f"auto-{label}"
+        wl_yaml = _make_mysql_workload(wl_name, label, namespace, mysql_image)
+        auto_generated.append({
+            "name": wl_name,
+            "kind": "Deployment",
+            "image": mysql_image,
+            "replicas": 1,
+            "yaml": wl_yaml,
+            "_auto": True,
+        })
+        logger.info("auto-generated workload %r for check target %r (mysql image: %s)", wl_name, label, mysql_image)
+        # Update deployed sets so later checks can match
+        deployed_names.add(wl_name)
+        deployed_apps.add(label)
+
+    if auto_generated:
+        cleaned_workloads = cleaned_workloads + auto_generated[:MAX_WORKLOADS - len(cleaned_workloads)]
 
     cleaned_checks = []
     for c in checks:
