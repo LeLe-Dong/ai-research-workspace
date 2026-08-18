@@ -102,8 +102,8 @@ def _make_mysql_workload(name: str, app_label: str, namespace: str, image: str) 
                         "resources": {"requests": {"cpu": "200m", "memory": "256Mi"},
                                        "limits": {"cpu": "500m", "memory": "512Mi"}},
                         "readinessProbe": {
-                            "exec": {"command": ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-pairwtest123"]},
-                            "initialDelaySeconds": 30, "periodSeconds": 10, "timeoutSeconds": 5,
+                            "exec": {"command": ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p", "airwtest123"]},
+                            "initialDelaySeconds": 60, "periodSeconds": 10, "timeoutSeconds": 5,
                         },
                     }],
                 },
@@ -121,6 +121,59 @@ def _make_mysql_workload(name: str, app_label: str, namespace: str, image: str) 
         },
     }
     return yaml.safe_dump(dep) + "\n---\n" + yaml.safe_dump(svc)
+
+
+def _mount_configmaps_if_present(plan: dict) -> None:
+    """Auto-mount ConfigMaps that share a name prefix with Deployments.
+
+    When the LLM generates ConfigMap mysql-master-init + Deployment
+    mysql-master, the Deployment should auto-mount the ConfigMap so
+    the init scripts are available. This function post-processes the
+    plan to inject volumeMounts + volumes for matching ConfigMaps.
+    """
+    configmaps = {}
+    deployments = []
+    for w in plan.get("workloads", []):
+        if w.get("kind") == "ConfigMap":
+            try:
+                doc = yaml.safe_load(w.get("yaml", ""))
+                if isinstance(doc, dict):
+                    cm_name = doc.get("metadata", {}).get("name", "")
+                    cm_namespace = doc.get("metadata", {}).get("namespace", "")
+                    # Extract the data keys (file names mounted)
+                    data = doc.get("data") or {}
+                    configmaps[cm_name] = {"namespace": cm_namespace, "keys": list(data.keys())}
+            except Exception:
+                pass
+        elif w.get("kind") == "Deployment":
+            deployments.append(w)
+
+    for dep in deployments:
+        try:
+            doc = yaml.safe_load(dep.get("yaml", ""))
+            if not isinstance(doc, dict):
+                continue
+            dep_name = doc.get("metadata", {}).get("name", "")
+            container = (doc.get("spec", {}).get("template", {}).get("spec", {}) or {}).get("containers", [{}])[0]
+            container_name = container.get("name", "mysql")
+            # Find matching ConfigMap by name prefix (e.g. mysql-master-init matches mysql-master)
+            for cm_name, cm_info in configmaps.items():
+                prefix = dep_name.replace("-init", "").replace("-config", "")
+                if cm_name.startswith(prefix) or prefix.startswith(cm_name.replace("-init", "")):
+                    mount_path = "/etc/mysql/conf.d"
+                    container["volumeMounts"] = container.get("volumeMounts", []) + [{
+                        "name": cm_name, "mountPath": mount_path, "readOnly": True
+                    }]
+                    volumes = doc.get("spec", {}).get("template", {}).get("spec", {}).get("volumes", [])
+                    volumes.append({
+                        "name": cm_name,
+                        "configMap": {"name": cm_name}
+                    })
+                    doc["spec"]["template"]["spec"]["volumes"] = volumes
+                    dep["yaml"] = yaml.safe_dump(doc)
+                    logger.info("auto-mounted ConfigMap %s into Deployment %s", cm_name, dep_name)
+        except Exception as e:
+            logger.warning("failed to auto-mount ConfigMap: %s", e)
 
 
 def _default_llm() -> StepfunClient | None:
@@ -497,6 +550,10 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
 
     if auto_generated:
         cleaned_workloads = cleaned_workloads + auto_generated[:MAX_WORKLOADS - len(cleaned_workloads)]
+
+    # Auto-mount ConfigMaps that match Deployments (e.g. mysql-master-init
+    # → mysql-master). Without this, LLM-generated ConfigMaps go unused.
+    _mount_configmaps_if_present(plan)
 
     cleaned_checks = []
     for c in checks:
