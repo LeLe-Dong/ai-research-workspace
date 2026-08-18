@@ -2,6 +2,7 @@
 import { useParams, useRouter } from "next/navigation";
 import { useState } from "react";
 import Link from "next/link";
+import { toast } from "sonner";
 import { useTopic, useIterateTopic, type TopicSession } from "@/features/topics/hooks";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -9,7 +10,7 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
-  GitBranch, ArrowRight, ArrowUpRight, Play, History, Loader2, Target, MessageSquare, Server, Sparkles,
+  GitBranch, ArrowRight, ArrowUpRight, Play, History, Loader2, Target, MessageSquare, Server, Sparkles, Wand2, CheckCircle2, X,
 } from "lucide-react";
 
 const statusLabel: Record<string, string> = {
@@ -33,6 +34,43 @@ export default function TopicDetailPage() {
   const [nextK8s, setNextK8s] = useState<number | null>(null);
   const [commitMsg, setCommitMsg] = useState("");
   const [iterOpen, setIterOpen] = useState(false);
+
+  // AI 生成方案 state
+  const [aiQuickOpen, setAiQuickOpen] = useState(false);
+  const [aiSubject, setAiSubject] = useState("");
+  const [aiGenerated, setAiGenerated] = useState<{ plan: any; source: string } | null>(null);
+  const [aiGenerating, setAiGenerating] = useState(false);
+
+  const generateAiPlan = async () => {
+    const s = aiSubject.trim();
+    if (!s) { toast.error("请先输入一句话研究主题"); return; }
+    setAiGenerating(true);
+    try {
+      const { api } = await import("@/lib/api");
+      const data = await api.post<any>("/api/v1/researches/generate-plan", { subject: s, use_llm: true });
+      setAiGenerated({ plan: data.plan, source: data.source });
+      toast.success("已生成研究方案，可预览后填入表单");
+    } catch (e) {
+      toast.error("生成失败", { description: (e as Error).message });
+    } finally {
+      setAiGenerating(false);
+    }
+  };
+
+  const applyAiPlan = () => {
+    if (!aiGenerated) return;
+    const p = aiGenerated.plan;
+    setNextTitle(p.title || "");
+    setNextGoal(p.goal || "");
+    setNextConstraints(p.constraints || "");
+    setNextOutput(p.expected_output || "");
+    if (typeof p.requires_k8s_validation === "number") {
+      setNextK8s(p.requires_k8s_validation === 1 ? 1 : p.requires_k8s_validation === -1 ? -1 : 0);
+    }
+    setAiQuickOpen(false);
+    setAiGenerated(null);
+    toast.success("AI 生成方案已填入表单", { description: "可继续修改后提交" });
+  };
 
   const latest = data?.sessions?.[data.sessions.length - 1];
   const isFirstRound = !latest;
@@ -187,6 +225,65 @@ export default function TopicDetailPage() {
                         ? "填写本轮研究目标（可留空，将基于主题名自动生成）"
                         : "可基于上一轮结果调整研究规范与目标：留空字段继承上一轮，填写则覆盖。"}
                     </p>
+                    {/* AI 生成方案 — 第一轮时可用 */}
+                    {isFirstRound && (
+                      <div className="rounded border border-dashed border-purple-500/30 bg-purple-500/5 p-3 space-y-2">
+                        <div className="flex items-center gap-2">
+                          <Wand2 className="h-3.5 w-3.5 text-purple-400" />
+                          <span className="text-xs font-medium">AI 一键生成研究方案</span>
+                        </div>
+                        <p className="text-[10px] text-muted-foreground">输入一句话主题，AI 自动生成完整研究计划</p>
+                        {!aiQuickOpen ? (
+                          <Button type="button" variant="outline" size="sm" onClick={() => {
+                            setAiQuickOpen(true);
+                            if (!aiSubject && data?.name) setAiSubject(data.name);
+                          }}>
+                            <Sparkles className="mr-1.5 h-3.5 w-3.5 text-purple-400" />
+                            开始生成
+                          </Button>
+                        ) : (
+                          <div className="space-y-2 mt-2">
+                            <div className="flex gap-2">
+                              <Input
+                                value={aiSubject}
+                                onChange={(e) => setAiSubject(e.target.value)}
+                                onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); generateAiPlan(); } }}
+                                placeholder="输入一句话研究主题..."
+                              />
+                              <Button type="button" size="sm" onClick={generateAiPlan} disabled={aiGenerating}>
+                                {aiGenerating ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Sparkles className="mr-1.5 h-3.5 w-3.5" />}
+                                生成
+                              </Button>
+                            </div>
+                            {aiGenerated && (
+                              <div className="rounded-md border bg-background/60 p-3 space-y-2">
+                                <p className="text-[10px] font-medium text-emerald-600 flex items-center gap-1">
+                                  <CheckCircle2 className="h-3.5 w-3.5" />
+                                  已生成方案（来源：{aiGenerated.source}）
+                                </p>
+                                <p className="text-sm font-medium">{aiGenerated.plan.title}</p>
+                                <p className="mt-1 line-clamp-3 text-xs text-muted-foreground">{aiGenerated.plan.goal}</p>
+                                <div className="flex flex-wrap gap-1.5 text-[10px]">
+                                  <Badge variant="outline">{aiGenerated.plan.depth}</Badge>
+                                  <Badge variant="outline">优先级 {aiGenerated.plan.priority}</Badge>
+                                  <Badge variant="outline">k8s验证: {aiGenerated.plan.requires_k8s_validation === 1 ? "开" : "自动"}</Badge>
+                                </div>
+                                <div className="mt-2 flex gap-2">
+                                  <Button type="button" size="sm" onClick={applyAiPlan}>
+                                    <CheckCircle2 className="mr-1.5 h-3.5 w-3.5" />
+                                    填入表单
+                                  </Button>
+                                  <Button type="button" variant="ghost" size="sm" onClick={() => setAiGenerated(null)}>
+                                    <X className="mr-1.5 h-3.5 w-3.5" />
+                                    丢弃
+                                  </Button>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )}
                     {latest && (
                       <div className="rounded border bg-muted/30 p-2.5 text-[11px] leading-relaxed text-muted-foreground">
                         <p className="flex items-center gap-1 font-medium text-foreground/80">
