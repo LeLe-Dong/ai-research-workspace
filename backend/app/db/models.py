@@ -53,8 +53,13 @@ class Research(Base):
     artifacts: Mapped[list["Artifact"]] = relationship(back_populates="research", cascade="all, delete-orphan")
 
 
-    # Version control
-    versions: Mapped[list["ResearchVersion"]] = relationship("ResearchVersion", order_by="ResearchVersion.version", back_populates="research")
+    # Version control — cascade delete so removing a research (or its topic)
+    # also cleans up its version snapshots (otherwise research_versions.research_id
+    # is set to NULL, violating NOT NULL).
+    versions: Mapped[list["ResearchVersion"]] = relationship(
+        "ResearchVersion", order_by="ResearchVersion.version",
+        back_populates="research", cascade="all, delete-orphan",
+    )
     reviews: Mapped[list["Review"]] = relationship("Review", back_populates="research", cascade="all, delete-orphan", lazy="selectin")
     topic: Mapped["ResearchTopic | None"] = relationship("ResearchTopic", back_populates="researches")
 

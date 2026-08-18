@@ -124,6 +124,19 @@ Pod 启动（pod_ready）只是最基本的前提，**不能作为主要验证�
 - 对于需要验证数据写入的场景，Pod 命令应包含：写入数据 → 等待复制 → 验证读取。
 - 对于需要验证故障切换的场景，Pod 命令应包含：停止主库 → 等待从库接管 → 验证新主库可用。
 
+【主从复制 / 集群类场景的强制要求】
+当研究目标涉及主从复制（MySQL replication、Redis replication、PG streaming replication 等）时：
+1. 必须提供"建立复制关系"的初始化配置，单靠启动参数（如 --server-id）无法建立复制：
+   - 主库：创建复制账号（如 CREATE USER 'repl'@'%' IDENTIFIED BY ...; GRANT REPLICATION SLAVE）
+   - 从库：执行 CHANGE MASTER TO / REPLICAOF 指向主库，然后 START SLAVE
+   - 建议通过 ConfigMap 挂载初始化 SQL/脚本，或 initContainer 执行
+2. 必须创建**独立的"验证 Pod"**（Deployment/Job），其命令包含完整的验证逻辑：
+   - 写入测试数据到主库 → 等待复制 → 从库查询验证 → 检查 SHOW SLAVE STATUS（IO/SQL 线程）
+   - 输出明确的成功标记（如 REPLICATION_VERIFIED / IO_RUNNING=YES）
+   - 之后用 pod_log_match 检查该验证 Pod 的日志，而不是检查裸的 MySQL 容器
+3. pod_log_match 的目标应该是"会实际输出验证标记的验证 Pod"，不能是裸数据库容器
+   （裸 MySQL 容器不会自动输出复制验证结果）。
+
 ## 具体要求
 
 1. 试验必须针对该研究的**具体推荐方案**（镜像、部署方式、配置参数），而不是泛化模板。
@@ -222,10 +235,16 @@ async def _ask_hermes_for_experiment(
         "## 核心原则：验证功能，不只是 Pod 启动\n"
         "Pod 就绪（pod_ready）只是前提，不能作为主要验证手段。\n"
         "必须为研究目标中的每个关键功能点生成功能验证检查：\n"
-        "- 主从复制：Pod 命令包含写入主库数据 + 从库读取验证，pod_log_match 检查复制成功标记\n"
+        "- 主从复制：需要额外的初始化配置建立复制关系（主库建复制账号 + 从库 CHANGE MASTER TO + START SLAVE），"
+        "并用独立验证 Pod 写入数据→等待复制→从库验证→输出 REPLICATION_VERIFIED 等标记\n"
         "- 高可用：Pod 命令模拟故障 + 验证切换\n"
         "- 性能：Pod 命令运行 redis-benchmark / pgbench / mysqlslap 并输出指标\n"
         "- 数据一致性：Pod 命令写入后验证读取结果\n\n"
+        "## 主从复制类场景强制要求\n"
+        "1. 必须提供建立复制关系的初始化（ConfigMap 挂载 SQL 脚本或 initContainer）："
+        "主库建复制账号，从库 CHANGE MASTER TO + START SLAVE。单靠启动参数无法建立复制。\n"
+        "2. 必须创建独立验证 Pod，其命令包含完整验证逻辑并输出明确标记；"
+        "pod_log_match 检查该验证 Pod 的日志，而不是裸 MySQL 容器。\n\n"
         "【要求】\n"
         f"0. 试验直接验证研究目标中的关键功能点，不只是 Pod 启动。\n"
         f"1. 命名空间必须用 {namespace}。\n"
@@ -808,7 +827,24 @@ async def run_experiment(
                 return {"passed": False, "evidence": "unsupported check"}
 
             task = asyncio.create_task(_run())
+            # Hard outer deadline: even if the check task itself never
+            # finishes (e.g. a stuck kubectl / broken event-loop time), we
+            # must not let the whole research hang. Each check has its own
+            # timeout_sec; we add +15s headroom then force-cancel the task.
+            check_start = asyncio.get_event_loop().time()
+            check_timeout = max(30, c.get("timeout_sec", 90) + 15)
+            res = None
             while not task.done():
+                if asyncio.get_event_loop().time() - check_start > check_timeout:
+                    # Force-terminate a stuck check so the experiment proceeds.
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    logger.warning("check %s exceeded outer timeout %ss; forced end", c["name"], check_timeout)
+                    res = {"passed": False, "evidence": f"检查超过外层超时 {check_timeout}s，已强制结束"}
+                    break
                 try:
                     msg = q.get_nowait()
                     yield AgentEvent(phase="validate", level="log",
@@ -820,14 +856,15 @@ async def run_experiment(
                 # would CANCEL the running check task on timeout. Just sleep
                 # and re-check task.done().
                 await asyncio.sleep(2)
-            try:
-                res = task.result()
-            except Exception as e:
-                # A single check crashing must not abort the whole experiment.
-                # Record it as a failed check and keep going (cleanup still
-                # runs in the outer finally).
-                logger.warning("check task %s raised: %s", c["name"], e)
-                res = {"passed": False, "evidence": f"检查执行异常: {type(e).__name__}: {str(e)[:150]}"}
+            if res is None:
+                try:
+                    res = task.result()
+                except Exception as e:
+                    # A single check crashing must not abort the whole experiment.
+                    # Record it as a failed check and keep going (cleanup still
+                    # runs in the outer finally).
+                    logger.warning("check task %s raised: %s", c["name"], e)
+                    res = {"passed": False, "evidence": f"检查执行异常: {type(e).__name__}: {str(e)[:150]}"}
             while not q.empty():
                 msg = q.get_nowait()
                 yield AgentEvent(phase="validate", level="log",
