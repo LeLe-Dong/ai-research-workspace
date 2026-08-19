@@ -1139,6 +1139,9 @@ async def run_experiment(
         return
 
     results = {"applied": [], "checks": []}
+    # Track workloads that failed to apply — checks targeting them are
+    # auto-skipped to avoid hanging on pod_log_match for non-existent pods.
+    _failed_workloads: set[str] = set()
     try:
         for i, w in enumerate(plan["workloads"]):
             yield AgentEvent(phase="validate", level="info",
@@ -1184,6 +1187,7 @@ async def run_experiment(
                                      detail=cmd_txt[:600],
                                      task_id="task-10")
             else:
+                _failed_workloads.add(w["name"])
                 yield AgentEvent(phase="validate", level="error",
                                  title=f"应用 {w['name']} 失败", detail=err[:200],
                                  task_id="task-10")
@@ -1192,6 +1196,17 @@ async def run_experiment(
         #    live progress through a queue, so the console shows the pod's
         #    state / endpoints / log tail in near-real-time while waiting.
         for ci, c in enumerate(plan["checks"]):
+            # Auto-skip checks whose target workload failed to apply —
+            # avoids hanging on pod_log_match for non-existent pods.
+            if c["target"] in _failed_workloads and not c.get("_skipped"):
+                c["_skipped"] = True
+                c["evidence"] = f"目标工作负载 {c['target']} 应用失败，断言跳过"
+                yield AgentEvent(phase="validate", level="warn",
+                                 title=f"断言跳过: {c['name']}",
+                                 detail=c["evidence"], task_id="task-10",
+                                 task_progress=min(80, 45 + ci * 3))
+                continue
+
             yield AgentEvent(phase="validate", level="info",
                              title=f"断言: {c['name']}",
                              detail=f"{c['type']} · {c['target']} · expect={c['expect']} · 超时 {c['timeout_sec']}s",
