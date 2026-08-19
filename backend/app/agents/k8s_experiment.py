@@ -70,6 +70,55 @@ def _resolve_mysql_image(workloads: list[dict]) -> str:
     return "registry.adms.io:31542/library/mysql:8.0"
 
 
+def _resolve_image_for_check(workloads: list[dict], target_label: str) -> str:
+    """Find the best image for a given check target based on the target name.
+
+    Returns a suitable image reference based on naming hints:
+    - mysql* → mysql:8.0
+    - postgres* → postgres:15
+    - redis* → redis:7.0.4
+    - mongo* → mongo:8.0
+    - nginx* → nginx:1.26.2-alpine
+    - default → busybox:1.0
+    """
+    target = target_label.lower()
+    known_images = {
+        "registry.adms.io:31542/library/mysql:8.0",
+        "registry.adms.io:31542/library/postgres:15",
+        "registry.adms.io:31542/library/redis:7.0.4",
+        "registry.adms.io:31542/library/mongo:8.0",
+        "registry.adms.io:31542/library/nginx:1.26.2-alpine",
+        "registry.adms.io:31542/library/busybox:1.0",
+    }
+    # Check workloads for any image matching this label
+    for w in workloads:
+        img = str(w.get("image", "")).lower()
+        if any(t in target for t in ("mysql", "mariadb")) and "mysql" in img:
+            return w.get("image", "")
+        if "postgres" in target and "postgres" in img:
+            return w.get("image", "")
+        if "redis" in target and "redis" in img:
+            return w.get("image", "")
+        if "mongo" in target and "mongo" in img:
+            return w.get("image", "")
+        if "nginx" in target and "nginx" in img:
+            return w.get("image", "")
+
+    # Default by label hint
+    if any(t in target for t in ("mysql", "mariadb")):
+        return "registry.adms.io:31542/library/mysql:8.0"
+    if "postgres" in target:
+        return "registry.adms.io:31542/library/postgres:15"
+    if "redis" in target:
+        return "registry.adms.io:31542/library/redis:7.0.4"
+    if "mongo" in target:
+        return "registry.adms.io:31542/library/mongo:8.0"
+    if "nginx" in target:
+        return "registry.adms.io:31542/library/nginx:1.26.2-alpine"
+    # Fallback to MySQL (most common in complex experiments)
+    return _resolve_mysql_image(workloads)
+
+
 def _make_mysql_workload(name: str, app_label: str, namespace: str, image: str) -> str:
     """Generate a minimal MySQL 8.0 Deployment + Service manifest for auto-provisioning.
 
@@ -121,6 +170,181 @@ def _make_mysql_workload(name: str, app_label: str, namespace: str, image: str) 
         },
     }
     return yaml.safe_dump(dep) + "\n---\n" + yaml.safe_dump(svc)
+
+
+    return yaml.safe_dump(dep) + "\n---\n" + yaml.safe_dump(svc)
+
+
+def _make_redis_workload(name: str, app_label: str, namespace: str, image: str) -> str:
+    """Generate a minimal Redis Deployment + Service manifest."""
+    dep = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": name, "namespace": namespace, "labels": {"app": app_label}},
+        "spec": {
+            "replicas": 1,
+            "selector": {"matchLabels": {"app": app_label}},
+            "template": {
+                "metadata": {"labels": {"app": app_label}},
+                "spec": {
+                    "restartPolicy": "Always",
+                    "containers": [{
+                        "name": "redis",
+                        "image": image,
+                        "ports": [{"containerPort": 6379, "name": "redis"}],
+                        "command": ["redis-server", "--save", "", "--appendonly", "no",
+                                     "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"],
+                        "resources": {"requests": {"cpu": "100m", "memory": "128Mi"},
+                                       "limits": {"cpu": "250m", "memory": "256Mi"}},
+                        "readinessProbe": {
+                            "exec": {"command": ["redis-cli", "-h", "127.0.0.1", "ping"]},
+                            "initialDelaySeconds": 5, "periodSeconds": 5, "timeoutSeconds": 3,
+                        },
+                    }],
+                },
+            },
+        },
+    }
+    svc = {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": name, "namespace": namespace, "labels": {"app": app_label}},
+        "spec": {
+            "selector": {"app": app_label},
+            "ports": [{"port": 6379, "targetPort": 6379, "name": "redis"}],
+            "type": "ClusterIP",
+        },
+    }
+    return yaml.safe_dump(dep) + "\n---\n" + yaml.safe_dump(svc)
+
+
+def _make_postgres_workload(name: str, app_label: str, namespace: str, image: str) -> str:
+    """Generate a minimal PostgreSQL Deployment + Service manifest."""
+    dep = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": name, "namespace": namespace, "labels": {"app": app_label}},
+        "spec": {
+            "replicas": 1,
+            "selector": {"matchLabels": {"app": app_label}},
+            "template": {
+                "metadata": {"labels": {"app": app_label}},
+                "spec": {
+                    "restartPolicy": "Always",
+                    "containers": [{
+                        "name": "postgres",
+                        "image": image,
+                        "ports": [{"containerPort": 5432, "name": "postgres"}],
+                        "env": [
+                            {"name": "POSTGRES_PASSWORD", "value": "airwtest123"},
+                            {"name": "POSTGRES_DB", "value": "testdb"},
+                        ],
+                        "resources": {"requests": {"cpu": "200m", "memory": "256Mi"},
+                                       "limits": {"cpu": "500m", "memory": "512Mi"}},
+                        "readinessProbe": {
+                            "exec": {"command": ["pg_isready", "-h", "127.0.0.1", "-U", "postgres"]},
+                            "initialDelaySeconds": 10, "periodSeconds": 5, "timeoutSeconds": 5,
+                        },
+                    }],
+                },
+            },
+        },
+    }
+    svc = {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": name, "namespace": namespace, "labels": {"app": app_label}},
+        "spec": {
+            "selector": {"app": app_label},
+            "ports": [{"port": 5432, "targetPort": 5432, "name": "postgres"}],
+            "type": "ClusterIP",
+        },
+    }
+    return yaml.safe_dump(dep) + "\n---\n" + yaml.safe_dump(svc)
+
+
+def _make_mongo_workload(name: str, app_label: str, namespace: str, image: str) -> str:
+    """Generate a minimal MongoDB Deployment + Service manifest."""
+    dep = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": name, "namespace": namespace, "labels": {"app": app_label}},
+        "spec": {
+            "replicas": 1,
+            "selector": {"matchLabels": {"app": app_label}},
+            "template": {
+                "metadata": {"labels": {"app": app_label}},
+                "spec": {
+                    "restartPolicy": "Always",
+                    "containers": [{
+                        "name": "mongo",
+                        "image": image,
+                        "ports": [{"containerPort": 27017, "name": "mongo"}],
+                        "command": ["mongod", "--bind_ip", "0.0.0.0", "--dbpath", "/data/db"],
+                        "resources": {"requests": {"cpu": "200m", "memory": "256Mi"},
+                                       "limits": {"cpu": "500m", "memory": "512Mi"}},
+                        "readinessProbe": {
+                            "exec": {"command": ["mongosh", "--eval", "db.runCommand('ping')"]},
+                            "initialDelaySeconds": 10, "periodSeconds": 5, "timeoutSeconds": 5,
+                        },
+                    }],
+                },
+            },
+        },
+    }
+    svc = {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": name, "namespace": namespace, "labels": {"app": app_label}},
+        "spec": {
+            "selector": {"app": app_label},
+            "ports": [{"port": 27017, "targetPort": 27017, "name": "mongo"}],
+            "type": "ClusterIP",
+        },
+    }
+    return yaml.safe_dump(dep) + "\n---\n" + yaml.safe_dump(svc)
+
+
+def _make_workload_for_image(name: str, app_label: str, namespace: str, image: str) -> str:
+    """Dispatch to the correct database-specific workload generator based on image."""
+    img_lower = image.lower()
+    if "mysql" in img_lower:
+        return _make_mysql_workload(name, app_label, namespace, image)
+    elif "postgres" in img_lower:
+        return _make_postgres_workload(name, app_label, namespace, image)
+    elif "redis" in img_lower:
+        return _make_redis_workload(name, app_label, namespace, image)
+    elif "mongo" in img_lower:
+        return _make_mongo_workload(name, app_label, namespace, image)
+    else:
+        # Fallback: generic BusyBox-based Deployment
+        return _make_busybox_workload(name, app_label, namespace, image)
+
+
+def _make_busybox_workload(name: str, app_label: str, namespace: str, image: str) -> str:
+    """Fallback: generic BusyBox/Alpine Deployment + Service."""
+    dep = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": name, "namespace": namespace, "labels": {"app": app_label}},
+        "spec": {
+            "replicas": 1,
+            "selector": {"matchLabels": {"app": app_label}},
+            "template": {
+                "metadata": {"labels": {"app": app_label}},
+                "spec": {
+                    "restartPolicy": "Always",
+                    "containers": [{
+                        "name": name.replace("-", ""),
+                        "image": image,
+                        "resources": {"requests": {"cpu": "50m", "memory": "64Mi"},
+                                       "limits": {"cpu": "100m", "memory": "128Mi"}},
+                    }],
+                },
+            },
+        },
+    }
+    return yaml.safe_dump(dep)
 
 
 def _mount_configmaps_if_present(plan: dict) -> None:
@@ -531,19 +755,19 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
         # Also skip if the label is a substring of any deployed name
         if any(label in n for n in deployed_names):
             continue
-        # Auto-generate a simple MySQL 8.0 Deployment + Service
-        mysql_image = _resolve_mysql_image(cleaned_workloads)
+        # Auto-generate a minimal Deployment + Service for this database type
+        auto_image = _resolve_image_for_check(cleaned_workloads, label)
         wl_name = f"auto-{label}"
-        wl_yaml = _make_mysql_workload(wl_name, label, namespace, mysql_image)
+        wl_yaml = _make_workload_for_image(wl_name, label, namespace, auto_image)
         auto_generated.append({
             "name": wl_name,
             "kind": "Deployment",
-            "image": mysql_image,
+            "image": auto_image,
             "replicas": 1,
             "yaml": wl_yaml,
             "_auto": True,
         })
-        logger.info("auto-generated workload %r for check target %r (mysql image: %s)", wl_name, label, mysql_image)
+        logger.info("auto-generated workload %r for check target %r (image: %s)", wl_name, label, auto_image)
         # Update deployed sets so later checks can match
         deployed_names.add(wl_name)
         deployed_apps.add(label)
