@@ -28,6 +28,31 @@
 
 ---
 
+## 产品截图
+
+### 仪表盘
+![Dashboard](docs/screenshots/dashboard.png)
+
+### 研究列表
+![Research List](docs/screenshots/research-list.png)
+
+### 研究详情
+![Research Detail](docs/screenshots/research-detail.png)
+
+### 执行视图
+![Execute View](docs/screenshots/research-detail.png)
+
+### 研究报告
+![Report](docs/screenshots/report.png)
+
+### 研究主题
+![Topics](docs/screenshots/topics.png)
+
+### 系统设置
+![Settings](docs/screenshots/settings.png)
+
+---
+
 ## 系统架构
 
 ```
