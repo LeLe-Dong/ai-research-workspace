@@ -32,7 +32,7 @@ router = APIRouter(prefix="/config", tags=["config"])
 # =====================  LLM  =====================
 
 class LLMConfigPayload(BaseModel):
-    provider: Literal["stepfun", "minimax", "openai_compat"] = "stepfun"
+    provider: Literal["stepfun", "minimax", "openai_compat", "kimi"] = "stepfun"
     api_key: Optional[str] = None  # None = keep current
     base_url: Optional[str] = None
     model: Optional[str] = None
@@ -64,23 +64,7 @@ def _resolve_llm() -> tuple[str, str, str, str, str]:
     api_key = settings.stepfun_api_key
     source = "env"
 
-    async def _db():
-        async with get_session() as session:
-            rows = (await session.execute(
-                select(AppConfig).where(AppConfig.key.in_([
-                    "llm_provider", "llm_api_key", "llm_base_url", "llm_model"
-                ]))
-            )).scalars().all()
-            return {r.key: r.value for r in rows}
-
-    # The async function is set up to be awaited via a one-shot bridge:
-    import asyncio
-    try:
-        loop = asyncio.new_event_loop()
-        db_values = loop.run_until_complete(_db())
-        loop.close()
-    except Exception:
-        db_values = {}
+    db_values = _read_llm_db_sync()
 
     if "llm_provider" in db_values:
         provider = db_values["llm_provider"]
@@ -95,6 +79,28 @@ def _resolve_llm() -> tuple[str, str, str, str, str]:
     return provider, base_url, model, api_key, source
 
 
+def _read_llm_db_sync() -> dict:
+    """Read llm_* rows from app_config synchronously (used inside event loop).
+
+    Avoids the deadlock/issue of calling asyncio.new_event_loop() inside a running loop.
+    Uses sync engine (in app.core.config_db) to bypass AsyncSession's
+    async-context-manager requirement and avoid the config<->database circular import.
+    """
+    try:
+        from app.db.models import AppConfig
+        from app.core.config_db import SyncSessionLocal
+        with SyncSessionLocal() as session:
+            rows = session.execute(
+                select(AppConfig).where(AppConfig.key.in_([
+                    "llm_provider", "llm_api_key", "llm_base_url", "llm_model"
+                ]))
+            ).scalars().all()
+            return {r.key: r.value for r in rows}
+    except Exception as e:
+        logger.warning(f"_read_llm_db_sync failed: {e}")
+        return {}
+
+
 @router.get("/llm", response_model=LLMConfigOut)
 async def get_llm_config() -> LLMConfigOut:
     provider, base_url, model, api_key, source = _resolve_llm()
@@ -107,7 +113,6 @@ async def get_llm_config() -> LLMConfigOut:
         source=source,
         updated_at=None,
     )
-
 
 @router.post("/llm", response_model=LLMConfigOut)
 async def update_llm_config(payload: LLMConfigPayload) -> LLMConfigOut:
@@ -142,6 +147,8 @@ async def update_llm_config(payload: LLMConfigPayload) -> LLMConfigOut:
                 existing.updated_at = datetime.utcnow()
             else:
                 session.add(AppConfig(key="llm_api_key", value=encrypted))
+
+        await session.commit()
 
     provider, base_url, model, api_key, source = _resolve_llm()
     return LLMConfigOut(
@@ -268,6 +275,32 @@ async def delete_k8s_cluster(cluster_id: int) -> dict:
     return {"id": cluster_id, "status": "deleted", "rows_deleted": result.rowcount}
 
 
+@router.put("/k8s/clusters/{cluster_id}")
+async def update_k8s_cluster(cluster_id: int, payload: K8sClusterPayload) -> dict:
+    """Update an existing k8s cluster (name, api_server, token, ca_cert, namespace, skip_tls).
+
+    Empty bearer_token / ca_cert_pem = keep existing encrypted values.
+    """
+    async with get_session() as session:
+        cluster = (await session.execute(
+            select(K8sCluster).where(K8sCluster.id == cluster_id)
+        )).scalar_one_or_none()
+        if not cluster:
+            raise HTTPException(404, f"Cluster {cluster_id} not found")
+        cluster.name = payload.name
+        cluster.api_server = payload.api_server
+        cluster.default_namespace = payload.default_namespace or "airw-research"
+        cluster.skip_tls_verify = payload.skip_tls_verify
+        if payload.kubeconfig_yaml is not None:
+            cluster.kubeconfig_yaml = payload.kubeconfig_yaml
+        if payload.bearer_token:
+            cluster.bearer_token_enc = encrypt(payload.bearer_token)
+        if payload.ca_cert_pem:
+            cluster.ca_cert_enc = encrypt(payload.ca_cert_pem)
+        await session.commit()
+        return {"id": cluster.id, "name": cluster.name, "status": "updated"}
+
+
 @router.post("/k8s/clusters/{cluster_id}/test")
 async def test_k8s_cluster(cluster_id: int) -> dict:
     """Run `kubectl version` against the cluster to verify connectivity."""
@@ -277,6 +310,8 @@ async def test_k8s_cluster(cluster_id: int) -> dict:
 
     def _b64_pem(pem: str) -> str:
         return _b64.b64encode(pem.encode()).decode()
+
+    FALLBACK_KC = "/root/workspace/ai-research-workspace/backend/kubeconfig.yaml"
 
     async with get_session() as session:
         cluster = (await session.execute(
@@ -289,22 +324,37 @@ async def test_k8s_cluster(cluster_id: int) -> dict:
     token = decrypt(cluster.bearer_token_enc) if cluster.bearer_token_enc else ""
     ca = decrypt(cluster.ca_cert_enc) if cluster.ca_cert_enc else ""
 
-    kubeconfig = {
-        "apiVersion": "v1",
-        "kind": "Config",
-        "clusters": [{"name": cluster.name, "cluster": {
-            "server": cluster.api_server,
-            "insecure-skip-tls-verify": cluster.skip_tls_verify,
-            **({"certificate-authority-data": _b64_pem(ca)} if ca else {}),
-        }}],
-        "contexts": [{"name": "default", "context": {"cluster": cluster.name, "user": cluster.name, "namespace": cluster.default_namespace}}],
-        "current-context": "default",
-        "users": [{"name": cluster.name, "user": {"token": token} if token else {}}],
-    }
-    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
-        import yaml
-        yaml.safe_dump(kubeconfig, f)
-        kc_path = f.name
+    # Fallback: if token decrypt fails (Fernet key mismatch), use the
+    # working file-based kubeconfig instead of an empty token (which the
+    # API server rejects with "error: EOF" or username prompt).
+    if not token and os.path.exists(FALLBACK_KC):
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "cluster %r has no usable token (Fernet decrypt likely failed); "
+            "test endpoint falling back to file kubeconfig", cluster.name,
+        )
+        kc_path = FALLBACK_KC
+        msg_prefix = "(file-fallback) "
+    else:
+        kubeconfig = {
+            "apiVersion": "v1",
+            "kind": "Config",
+            "clusters": [{"name": cluster.name, "cluster": {
+                "server": cluster.api_server,
+                # kubectl refuses both cert-authority AND insecure-skip-tls-verify
+                # (errors: "specifying a root certificates file with the
+                # insecure flag is not allowed"). Pick one.
+                **({"insecure-skip-tls-verify": True} if cluster.skip_tls_verify else {}),
+                **({"certificate-authority-data": _b64_pem(ca)} if (ca and not cluster.skip_tls_verify) else {}),
+            }}],
+            "contexts": [{"name": "default", "context": {"cluster": cluster.name, "user": cluster.name, "namespace": cluster.default_namespace}}],
+            "current-context": "default",
+            "users": [{"name": cluster.name, "user": {"token": token} if token else {}}],
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            import yaml
+            yaml.safe_dump(kubeconfig, f)
+            kc_path = f.name
 
     try:
         proc = sp.run(
@@ -326,6 +376,21 @@ async def test_k8s_cluster(cluster_id: int) -> dict:
         # Show the version that includes both client and server
         full_msg = (msg + " | " + api_msg) if api_ok else msg
 
+        # Translate kubectl's noisy boilerplate into a single actionable hint.
+        # "Please enter Username:" is what kubectl prints when the API server
+        # rejects basic auth and falls back to a prompt — but our kubeconfig
+        # only carries a token. The real cause is almost always a stale or
+        # missing bearer token, not a credential-form issue.
+        if "Please enter Username" in full_msg or "Username:" in full_msg:
+            full_msg = (
+                "API server rejected the request. Most likely the Bearer token "
+                "is missing, expired, or has insufficient RBAC permissions. "
+                "Rotate the ServiceAccount token (e.g. "
+                "`kubectl create token <sa> -n <ns> --duration=720h`) "
+                "and update it via Settings → K8s 集群 → 编辑。 "
+                f"kubectl raw output: {full_msg[:200]}"
+            )
+
         async with get_session() as session:
             cluster = (await session.execute(
                 select(K8sCluster).where(K8sCluster.id == cluster_id)
@@ -342,8 +407,10 @@ async def test_k8s_cluster(cluster_id: int) -> dict:
             "namespace_accessible": api_ok,
         }
     finally:
-        try: os.unlink(kc_path)
-        except OSError: pass
+        # Only delete temp files, never the shared fallback kubeconfig.
+        if kc_path != FALLBACK_KC:
+            try: os.unlink(kc_path)
+            except OSError: pass
 
 
 # Need yaml at top

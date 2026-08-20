@@ -19,6 +19,15 @@ storage/airw.db-journal
 storage/artifacts/*
 !storage/artifacts/.gitkeep
 
+# Knowledge base (user-uploaded documents)
+knowledge_base/
+backend/knowledge_base/
+
+# Environment files (contain secrets)
+.env
+.env.*
+!.env.example
+
 # IDE
 .vscode/
 .idea/
@@ -27,3 +36,4 @@ storage/artifacts/*
 # Misc
 *.swp
 *.bak
+*.backup

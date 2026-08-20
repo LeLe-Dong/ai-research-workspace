@@ -8,7 +8,12 @@ export function Providers({ children }: { children: React.ReactNode }) {
       new QueryClient({
         defaultOptions: {
           queries: {
-            staleTime: 10_000,
+            // Default 30s — long enough that navigating between pages
+            // doesn't refetch sidebar/topbar data, short enough that
+            // returning after a break gets fresh state.
+            // Per-query overrides (e.g. Sidebar uses 60s) take precedence.
+            staleTime: 30_000,
+            gcTime: 5 * 60_000,
             refetchOnWindowFocus: false,
             retry: 1,
           },

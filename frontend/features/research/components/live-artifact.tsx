@@ -69,6 +69,8 @@ export function K8sExperimentPanel({ artifact }: { artifact: ArtifactOut }) {
   const workloads: any[] = data.workloads ?? [];
   const passed = data.passed ?? 0;
   const total = data.total ?? checks.length;
+  const skipped = data.skipped ?? 0;
+  const actualTotal = data.actual_total ?? (total - skipped);
 
   const typeLabel: Record<string, string> = {
     pod_ready: "Pod 就绪",
@@ -129,13 +131,14 @@ export function K8sExperimentPanel({ artifact }: { artifact: ArtifactOut }) {
               <p className="text-[10px] text-muted-foreground">命名空间</p>
               <p className="truncate font-mono text-[10px]">{data.namespace || "—"}</p>
             </div>
-            <div className="rounded border p-2" style={{ borderColor: total > 0 && passed === total ? "rgb(16 185 129 / 0.4)" : total === 0 ? undefined : "rgb(245 158 11 / 0.4)" }}>
+            <div className="rounded border p-2" style={{ borderColor: actualTotal > 0 && passed === actualTotal ? "rgb(16 185 129 / 0.4)" : actualTotal === 0 ? undefined : "rgb(245 158 11 / 0.4)" }}>
               <p className="text-[10px] text-muted-foreground">断言通过率</p>
               <p className="font-bold">
-                {passed}/{total}
+                {passed}/{actualTotal}
                 <span className="ml-1 text-[10px] font-normal text-muted-foreground">
-                  {total > 0 ? (passed === total ? "全部通过" : "有失败") : "无断言"}
+                  {actualTotal > 0 ? (passed === actualTotal ? "全部通过" : "有失败") : "无断言"}
                 </span>
+                {skipped > 0 && <span className="ml-1 text-[10px] font-normal text-zinc-500">（{skipped} 项已跳过）</span>}
               </p>
             </div>
           </div>

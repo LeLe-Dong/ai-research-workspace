@@ -119,24 +119,40 @@ export function ResizeSplitter({
       onPointerMove={handleMove}
       onPointerUp={handleEnd}
       onPointerCancel={handleEnd}
+      title={ariaLabel ? `${ariaLabel} (${Math.round(controlledSize)}px)` : undefined}
       className={cn(
-        "relative flex shrink-0 items-center justify-center bg-border transition-colors",
+        "relative flex shrink-0 items-center justify-center bg-border transition-colors group",
         direction === "horizontal"
-          ? "w-1 cursor-col-resize hover:bg-primary/50"
-          : "h-1 cursor-row-resize hover:bg-primary/50",
+          ? "w-1.5 cursor-col-resize hover:bg-primary/50"
+          : "h-1.5 cursor-row-resize hover:bg-primary/50",
         isDragging && "bg-primary"
       )}
     >
-      {/* Visual grip indicator */}
+      {/* Always-visible drag handle indicator.
+          pointer-events-none so the parent's pointer handlers always win,
+          even if the user clicks on the indicator area which extends
+          beyond the 1.5px hit box. */}
       <div
         className={cn(
-          "absolute rounded-full bg-muted-foreground/40 transition-opacity",
-          direction === "horizontal"
-            ? "h-8 w-0.5"
-            : "h-0.5 w-8",
-          isDragging ? "opacity-0" : "opacity-0 hover:opacity-100"
+          "absolute flex items-center justify-center gap-0.5 pointer-events-none",
+          direction === "horizontal" ? "h-8 w-full flex-col" : "h-full w-8 flex-row",
+          isDragging ? "opacity-0" : "opacity-70 group-hover:opacity-100 transition-opacity"
         )}
-      />
+      >
+        {direction === "vertical" ? (
+          <>
+            <span className="h-0.5 w-3 rounded-full bg-muted-foreground/70" />
+            <span className="h-0.5 w-3 rounded-full bg-muted-foreground/70" />
+            <span className="h-0.5 w-3 rounded-full bg-muted-foreground/70" />
+          </>
+        ) : (
+          <>
+            <span className="h-3 w-0.5 rounded-full bg-muted-foreground/70" />
+            <span className="h-3 w-0.5 rounded-full bg-muted-foreground/70" />
+            <span className="h-3 w-0.5 rounded-full bg-muted-foreground/70" />
+          </>
+        )}
+      </div>
     </div>
   );
 }

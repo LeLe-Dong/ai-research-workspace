@@ -1,7 +1,8 @@
 "use client";
-import { CheckCircle2, Circle, Loader2, FlaskConical } from "lucide-react";
+import { CheckCircle2, Circle, Loader2, FlaskConical, X } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 import type { TaskNode } from "@/lib/types";
@@ -21,7 +22,15 @@ function StatusIcon({ status }: { status: string }) {
   return <Circle className="h-4 w-4 text-muted-foreground/40" />;
 }
 
-export function TaskTree({ tasks }: { tasks?: TaskNode[] }) {
+interface TaskTreeProps {
+  tasks?: TaskNode[];
+  /** Currently selected task id; click again or the × chip to clear. */
+  selectedTaskId?: string | null;
+  /** Called when the user picks a task. Pass null to clear. */
+  onSelectTask?: (taskId: string | null) => void;
+}
+
+export function TaskTree({ tasks, selectedTaskId, onSelectTask }: TaskTreeProps) {
   if (!tasks) return <div className="p-4 text-xs text-muted-foreground">加载任务中...</div>;
   if (tasks.length === 0) {
     return (
@@ -43,6 +52,13 @@ export function TaskTree({ tasks }: { tasks?: TaskNode[] }) {
     tasks.reduce((sum, t) => sum + t.progress, 0) / tasks.length,
   );
 
+  const selectedTask = selectedTaskId ? tasks.find(t => t.id === selectedTaskId) : null;
+
+  const handleClick = (id: string) => {
+    if (!onSelectTask) return;
+    onSelectTask(selectedTaskId === id ? null : id);
+  };
+
   return (
     <div className="flex h-full flex-col">
       <div className="border-b px-4 py-3">
@@ -56,6 +72,21 @@ export function TaskTree({ tasks }: { tasks?: TaskNode[] }) {
         </div>
         <Progress value={overallProgress} className="mt-2 h-1" />
         <p className="mt-1 text-[10px] text-muted-foreground">{overallProgress}% 总进度</p>
+        {selectedTask && (
+          <div className="mt-2 flex items-center gap-1.5 rounded-md border bg-primary/5 px-2 py-1 text-[10px]">
+            <span className="text-primary font-medium">筛选中</span>
+            <span className="flex-1 truncate text-muted-foreground">{selectedTask.name}</span>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-4 w-4 shrink-0 hover:bg-primary/10"
+              onClick={() => onSelectTask?.(null)}
+              title="清除选择 (Esc)"
+            >
+              <X className="h-3 w-3" />
+            </Button>
+          </div>
+        )}
       </div>
 
       <ScrollArea className="flex-1">
@@ -73,16 +104,26 @@ export function TaskTree({ tasks }: { tasks?: TaskNode[] }) {
                 <ul className="space-y-0.5">
                   {items.map((t) => {
                     const isK8s = t.phase === "validation";
+                    const isSelected = selectedTaskId === t.id;
                     return (
                       <li key={t.id}>
-                        <div
+                        <button
+                          type="button"
+                          onClick={() => handleClick(t.id)}
                           className={cn(
-                            "group flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-accent/40",
-                            isK8s && t.status === "running" && "bg-cyan-500/10 ring-1 ring-cyan-500/30 animate-pulse"
+                            "group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors cursor-pointer",
+                            "hover:bg-accent/40",
+                            isK8s && t.status === "running" && "bg-cyan-500/10 ring-1 ring-cyan-500/30 animate-pulse",
+                            isSelected && "bg-primary/10 ring-1 ring-primary/40 hover:bg-primary/15"
                           )}
+                          title={isSelected ? "点击取消选择" : `点击查看「${t.name}」的日志`}
+                          aria-pressed={isSelected}
                         >
                           <StatusIcon status={t.status} />
-                          <span className="flex-1 truncate text-xs">
+                          <span className={cn(
+                            "flex-1 truncate text-xs",
+                            isSelected && "font-medium text-foreground"
+                          )}>
                             {isK8s && <span className="mr-1">☸</span>}
                             {t.name}
                           </span>
@@ -92,7 +133,7 @@ export function TaskTree({ tasks }: { tasks?: TaskNode[] }) {
                           {t.progress > 0 && t.progress < 100 && (
                             <span className="text-[10px] text-muted-foreground">{t.progress}%</span>
                           )}
-                        </div>
+                        </button>
                       </li>
                     );
                   })}

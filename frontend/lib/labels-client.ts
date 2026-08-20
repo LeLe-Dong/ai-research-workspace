@@ -2,10 +2,10 @@
 
 import type { AgentMode } from "./types";
 
-export const AGENT_MODE_KEYS: AgentMode[] = ["mock", "stepfun", "hermes-researcher"];
+export const AGENT_MODE_KEYS: AgentMode[] = ["mock", "llm", "hermes-researcher"];
 
 export const AGENT_MODE_LABELS: Record<AgentMode, string> = {
   mock: "演示模式",
-  stepfun: "Stepfun LLM",
+  llm: "LLM 模型",
   "hermes-researcher": "Hermes 研究员",
 };

@@ -2,15 +2,13 @@
 
 Endpoints:
   GET  /api/v1/admin/agent-mode       — get current mode (DB override or env default)
-  POST /api/v1/admin/agent-mode       — change mode (writes to DB + spawns restart watcher)
-  GET  /api/v1/admin/restart-status   — last restart attempt result
+  POST /api/v1/admin/agent-mode       — change mode (writes to DB; restarts via systemd if enabled)
+  GET  /api/v1/admin/restart-status   — last restart attempt result (admin manual restarts)
 """
 import asyncio
 import logging
 import os
-import signal
-import subprocess
-import time
+import threading
 from datetime import datetime
 from typing import Literal
 
@@ -27,8 +25,9 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 
 
 class AgentModePayload(BaseModel):
-    mode: Literal["mock", "stepfun", "hermes-researcher"]
-    stepfun_api_key: str | None = None  # optional override
+    mode: Literal["mock", "llm", "hermes-researcher"]  # llm = uses LLM card config
+    # Legacy field kept for backwards-compat POSTs; no longer used (LLM key lives in /config/llm)
+    stepfun_api_key: str | None = None
 
 
 @router.get("/agent-mode")
@@ -60,14 +59,24 @@ async def get_restart_status() -> dict:
 
 @router.post("/agent-mode")
 async def set_agent_mode(payload: AgentModePayload) -> dict:
-    """Persist new agent mode to DB. Caller must restart the backend for change to take effect.
+    """Persist new agent mode to DB. The backend runs under systemd
+    (`airw-backend.service`), and this box is configured with systemd's
+    `Restart=always` so crash-recovery is automatic.
 
-    If AIRW_AUTO_RESTART=1, this endpoint will also spawn a restart watcher that
-    kills the current uvicorn and starts a new one with the new mode (via setsid).
+    When `AIRW_AUTO_RESTART=systemd` (default), this endpoint will additionally
+    trigger a non-blocking `systemctl restart airw-backend.service` from a
+    daemon thread, so the new mode is live within ~3-5 seconds without the
+    user having to log in to the server. Set `AIRW_AUTO_RESTART=off` to opt out
+    and require manual `sudo systemctl restart airw-backend.service`.
+
+    Implementation note: the restart is launched via a daemon thread (NOT
+    asyncio, NOT a subprocess in the request handler) because `systemctl
+    restart` issues SIGTERM to the current process — we need to let this
+    response escape first, then schedule the restart.
     """
     new_mode = payload.mode
 
-    # Persist to DB
+    # 1) Persist to DB
     async with get_session() as session:
         existing = (await session.execute(
             select(AppConfig).where(AppConfig.key == "agent_mode")
@@ -87,103 +96,42 @@ async def set_agent_mode(payload: AgentModePayload) -> dict:
                 session.add(AppConfig(key="stepfun_api_key", value=payload.stepfun_api_key))
         await session.commit()
 
-    # Spawn restart watcher
-    auto_restart = os.environ.get("AIRW_AUTO_RESTART", "1") == "1"
-    if auto_restart:
-        _spawn_restart_watcher(new_mode)
+    # 2) Decide whether to auto-restart
+    auto_restart = os.environ.get("AIRW_AUTO_RESTART", "systemd").lower()
+    if auto_restart == "systemd":
+        # Schedule restart on a daemon thread so this response can complete first.
+        # 1.2s lets the response get on the wire before SIGTERM hits us.
+        def _do_restart():
+            import subprocess as _sp
+            try:
+                _sp.run(
+                    ["systemctl", "restart", "airw-backend.service"],
+                    timeout=10, check=False,
+                )
+            except Exception as e:
+                logger.error(f"systemctl restart failed: {e}")
+
+        threading.Thread(target=_do_restart, daemon=True).start()
         return {
             "status": "restarting",
             "mode": new_mode,
-            "message": "已切换模式。系统将在 3 秒内重启后端服务（约 5-10 秒不可用）。",
+            "message": (
+                f"已写入数据库：mode={new_mode}。"
+                "systemd 将在 1-3 秒内重启 airw-backend.service，"
+                "前端会短暂连不上（约 3-5 秒），刷新即可。"
+            ),
         }
+
+    # AIRW_AUTO_RESTART=off: caller must restart manually
     return {
         "status": "updated_db",
         "mode": new_mode,
-        "message": "已写入数据库。请手动重启后端服务生效。",
+        "message": (
+            f"已写入数据库：mode={new_mode}。"
+            "AIRW_AUTO_RESTART=off，需要手动重启后端："
+            "sudo systemctl restart airw-backend.service"
+        ),
     }
-
-
-def _spawn_restart_watcher(new_mode: str) -> None:
-    """Spawn an independent process (setsid) that kills the current uvicorn
-    and starts a new one with the new agent mode. The watcher itself stays alive
-    independently of the current uvicorn process (via setsid + nohup)."""
-    import tempfile
-
-    backend_dir = "/root/workspace/ai-research-workspace/backend"
-    venv_activate = "source /root/workspace/ai-test-platform/.venv/bin/activate"
-
-    # Build env vars to pass through to the new uvicorn
-    env_exports = [
-        f"export AIRW_AGENT_MODE={new_mode}",
-    ]
-    # Preserve stepfun API key
-    if os.environ.get("AIRW_STEPFUN_API_KEY"):
-        env_exports.append(
-            f"export AIRW_STEPFUN_API_KEY='{os.environ['AIRW_STEPFUN_API_KEY']}'"
-        )
-    if os.environ.get("AIRW_STEPFUN_MODEL"):
-        env_exports.append(
-            f"export AIRW_STEPFUN_MODEL={os.environ['AIRW_STEPFUN_MODEL']}"
-        )
-    env_exports.append("export AIRW_DB_PATH=storage/airw.db")
-
-    # Marker: write to DB to confirm restart happened
-    marker = f"export AIRW_RESTART_MARKER={int(time.time())}"
-
-    script = f"""#!/bin/bash
-# Auto-generated restart watcher for AIRW backend
-# Kills current uvicorn and starts a new one with new mode.
-
-set -e
-LOG=/tmp/airw-restart.log
-echo "[$(date)] Restart watcher started (new mode={new_mode})" >> $LOG
-
-# Wait briefly so the HTTP response can complete
-sleep 3
-
-# Find and kill the current uvicorn for port 8003
-echo "[$(date)] Killing current uvicorn..." >> $LOG
-for pid in $(ss -tlnp 2>/dev/null | grep ':8003 ' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do
-    echo "[$(date)] Killing pid=$pid" >> $LOG
-    kill -TERM $pid 2>/dev/null || true
-done
-# Also kill any python uvicorn matching our backend
-pkill -TERM -f 'app.main:app.*--port 8003' 2>/dev/null || true
-
-# Wait for processes to exit
-sleep 2
-
-# Start new uvicorn
-cd {backend_dir}
-{chr(10).join(env_exports)}
-{marker}
-
-nohup python -m uvicorn app.main:app \
-    --host 0.0.0.0 --port 8003 \
-    --log-level warning \
-    > /tmp/airw-uvicorn.log 2>&1 &
-
-NEW_PID=$!
-echo "[$(date)] New uvicorn started pid=$NEW_PID" >> $LOG
-disown
-exit 0
-"""
-
-    fd, path = tempfile.mkstemp(suffix=".sh", prefix="airw-restart-")
-    os.write(fd, script.encode())
-    os.close(fd)
-    os.chmod(path, 0o755)
-
-    # Spawn detached (setsid makes it independent of current process group)
-    subprocess.Popen(
-        [path],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,  # equivalent to setsid
-        env={**os.environ, "AIRW_RESTART_SCRIPT": path},
-    )
-    logger.info(f"Restart watcher spawned: {path}")
 
 
 # --- Stuck Research Recovery ---

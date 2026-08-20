@@ -12,6 +12,12 @@ class ResearchRequest:
     expected_output: str
     depth: str
     priority: str
+    # 0=auto (default), 1=force on, -1=force off — see services/decision.py
+    requires_k8s_validation: int = 0
+    # Personalized style: 1 = inject a KnowledgeStyle into prompt
+    use_custom_style: int = 0
+    # NULL = use currently active style; non-null = bind to specific style
+    style_id: str | None = None
 
 
 @dataclass

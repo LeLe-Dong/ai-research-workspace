@@ -1,6 +1,6 @@
 "use client";
 import Link from "next/link";
-import { ChevronRight, FlaskConical, Activity } from "lucide-react";
+import { ChevronRight, FlaskConical, Activity, Eye } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -82,7 +82,18 @@ export function RecentResearches({ items, loading }: { items?: RecentResearch[];
                     </Link>
                   </Button>
                 ) : (
-                  <ChevronRight className="h-4 w-4 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
+                  <Button
+                    asChild
+                    size="sm"
+                    variant="outline"
+                    className="h-7 gap-1 px-2.5 text-xs opacity-0 transition-opacity group-hover:opacity-100"
+                    title="查看该次作业的执行快照"
+                  >
+                    <Link href={`/research/${r.id}/execute`}>
+                      <Eye className="h-3 w-3" />
+                      查看运行详情
+                    </Link>
+                  </Button>
                 )}
               </div>
             );

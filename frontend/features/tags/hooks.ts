@@ -35,8 +35,9 @@ export function useAttachTag() {
       if (tagId) payload.tag_id = tagId;
       return api.post<any>(`/api/v1/tags/researches/${researchId}/attach`, payload);
     },
-    onSuccess: (data) => {
-      qc.invalidateQueries({ queryKey: ["research"] });
+    onSuccess: (data, variables) => {
+      // Only invalidate the specific research + tags, not everything
+      qc.invalidateQueries({ queryKey: ["research", variables.researchId] });
       qc.invalidateQueries({ queryKey: ["tags"] });
       toast.success(`已添加标签：${data.tag.name}`);
     },
@@ -49,8 +50,8 @@ export function useDetachTag() {
     mutationFn: async ({ researchId, tagId }: { researchId: string; tagId: string }) => {
       return api.post<any>(`/api/v1/tags/researches/${researchId}/detach?tag_id=${tagId}`);
     },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["research"] });
+    onSuccess: (_, variables) => {
+      qc.invalidateQueries({ queryKey: ["research", variables.researchId] });
       qc.invalidateQueries({ queryKey: ["tags"] });
       toast.success("已移除标签");
     },

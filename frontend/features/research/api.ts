@@ -2,7 +2,7 @@ import { api, API_BASE } from "@/lib/api";
 import type { ResearchCreate, ResearchDetail, ResearchSummary } from "@/lib/types";
 
 export const researchApi = {
-  list: (params?: { tag?: string }) => api.get<ResearchSummary[]>("/api/v1/researches", { params }),
+  list: (params?: { tag?: string; q?: string }) => api.get<ResearchSummary[]>("/api/v1/researches", { params }),
   expandGoal: (goal: string) => api.post<{
     original: string;
     expanded: string;

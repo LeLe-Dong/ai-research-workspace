@@ -2,7 +2,7 @@
 import { useParams, useRouter } from "next/navigation";
 import { useState } from "react";
 import Link from "next/link";
-import { FlaskConical, ArrowLeft, Loader2, Clock, History, Activity, Sparkles, FileText, AlertTriangle, RotateCcw } from "lucide-react";
+import { FlaskConical, ArrowLeft, Loader2, Clock, History, Activity, Sparkles, FileText, AlertTriangle, RotateCcw, Eye } from "lucide-react";
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -11,9 +11,13 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { formatRelativeTime } from "@/lib/utils";
 import { toast } from "sonner";
 import { useResearch } from "@/features/research/hooks";
+import { useResearchSummary } from "@/features/research/hooks-report";
+import { usePrefetchExecute } from "@/features/research/prefetch";
+import { ProgressCard } from "@/features/research/components/progress-card";
 import { TagSelector } from "@/features/tags/components/tag-selector";
 import { useDetachTag } from "@/features/tags/hooks";
 import { useStartResearch } from "@/features/research/hooks";
+import { PrefetchLink } from "@/components/prefetch-link";
 
 const statusVariant = {
   pending: "secondary",
@@ -33,22 +37,26 @@ export default function ResearchDetailPage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
   const { data, isLoading, error } = useResearch(params.id);
+  const summary = useResearchSummary(params.id);
   const detachTag = useDetachTag();
   const start = useStartResearch(params.id);
   const [starting, setStarting] = useState(false);
+  const prefetchExecute = usePrefetchExecute();
   const onStart = async () => {
     if (starting) return;
     setStarting(true);
-    try {
-      await start.mutateAsync();
-      toast.success("已重新执行", { description: "正在跳转到执行视图…" });
-      // Navigate to execute view so user can see live progress
-      router.push(`/research/${params.id}/execute`);
-    } catch (e) {
-      toast.error("启动失败", { description: (e as Error).message });
-      setStarting(false);
-    }
-    // Note: not resetting starting on success - we're navigating away
+    // Fire-and-forget: start the research, navigate immediately.
+    // The execute page will pick up the running state via SSE / polling.
+    start.mutate(undefined, {
+      onSuccess: () => {
+        toast.success("已重新执行", { description: "正在跳转到执行视图…" });
+      },
+      onError: (e) => {
+        toast.error("启动失败", { description: (e as Error).message });
+        setStarting(false);
+      },
+    });
+    router.push(`/research/${params.id}/execute`);
   };
 
   if (error) {
@@ -114,10 +122,21 @@ export default function ResearchDetailPage() {
                         错误信息：<code className="rounded bg-muted px-1 py-0.5 text-[10px]">{data.error_message}</code>
                       </p>
                     </div>
-                    <Button size="sm" onClick={onStart} disabled={starting}>
-                      <RotateCcw className="mr-1.5 h-3.5 w-3.5" />
-                      重新执行（会自动 fallback 到 mock）
-                    </Button>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Button asChild size="sm">
+                        <Link href={`/research/${data.id}/execute`}
+                            onMouseEnter={prefetchExecute.bind(null, data.id)}
+                            onFocus={prefetchExecute.bind(null, data.id)}
+                            onTouchStart={prefetchExecute.bind(null, data.id)}>
+                          <Eye className="mr-1.5 h-3.5 w-3.5" />
+                          查看运行详情
+                        </Link>
+                      </Button>
+                      <Button size="sm" variant="outline" onClick={onStart} disabled={starting}>
+                        <RotateCcw className="mr-1.5 h-3.5 w-3.5" />
+                        重新执行（会自动 fallback 到 mock）
+                      </Button>
+                    </div>
                   </div>
                 </div>
               </CardContent>
@@ -193,6 +212,15 @@ export default function ResearchDetailPage() {
                   ) : data.status === "completed" ? (
                     <div className="flex flex-wrap items-center gap-3">
                       <Button asChild>
+                        <Link href={`/research/${data.id}/execute`}
+                            onMouseEnter={prefetchExecute.bind(null, data.id)}
+                            onFocus={prefetchExecute.bind(null, data.id)}
+                            onTouchStart={prefetchExecute.bind(null, data.id)}>
+                          <Eye className="mr-1.5 h-3.5 w-3.5" />
+                          查看运行详情
+                        </Link>
+                      </Button>
+                      <Button asChild variant="outline">
                         <Link href={`/research/${data.id}/report`}>
                           <FileText className="mr-1.5 h-3.5 w-3.5" />
                           查看完整报告
@@ -205,7 +233,28 @@ export default function ResearchDetailPage() {
                         </Link>
                       </Button>
                       <span className="text-xs text-muted-foreground">
-                        重新执行可在报告页操作
+                        重新执行可在运行详情页操作
+                      </span>
+                    </div>
+                  ) : data.status === "failed" ? (
+                    <div className="flex flex-wrap items-center gap-3">
+                      <Button asChild>
+                        <Link href={`/research/${data.id}/execute`}
+                            onMouseEnter={prefetchExecute.bind(null, data.id)}
+                            onFocus={prefetchExecute.bind(null, data.id)}
+                            onTouchStart={prefetchExecute.bind(null, data.id)}>
+                          <Eye className="mr-1.5 h-3.5 w-3.5" />
+                          查看运行详情
+                        </Link>
+                      </Button>
+                      <Button asChild variant="outline">
+                        <Link href={`/research/${data.id}/history`}>
+                          <History className="mr-1.5 h-3.5 w-3.5" />
+                          版本历史
+                        </Link>
+                      </Button>
+                      <span className="text-xs text-muted-foreground">
+                        可在运行详情页查看 timeline 与 task 状态
                       </span>
                     </div>
                   ) : (
@@ -218,6 +267,14 @@ export default function ResearchDetailPage() {
 
           {/* Sidebar */}
           <aside className="space-y-4">
+            {/* Execution progress — visible immediately so the user knows
+                *what* state a research is in, even without entering the
+                execute view. Polls every 3s while running. */}
+            <ProgressCard
+              summary={summary.data}
+              loading={summary.isLoading}
+            />
+
             <Card>
               <CardHeader className="pb-3">
                 <CardTitle className="text-sm">快速操作</CardTitle>

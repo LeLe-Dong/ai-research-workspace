@@ -7,7 +7,7 @@ import { Topbar } from "@/components/topbar";
 import { Toaster } from "sonner";
 import { Providers } from "@/lib/providers";
 import { CommandPaletteRoot } from "@/components/command-palette-root";
-import { ErrorBoundary } from "@/components/error-boundary";;
+import { ErrorBoundary } from "@/components/error-boundary";
 
 export const metadata: Metadata = {
   title: "AI Research Workspace",

@@ -14,7 +14,7 @@ import { useEffect, useRef } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 
 const API_BASE = (typeof window !== "undefined"
-  ? `${window.location.protocol}//${window.location.hostname}:8003`
+  ? window.location.origin
   : "http://127.0.0.1:8003");
 
 interface StreamEvent {

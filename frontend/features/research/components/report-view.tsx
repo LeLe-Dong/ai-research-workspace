@@ -220,7 +220,6 @@ export function ReportView({ report }: { report: Report }) {
   const { data: tasks } = useQuery({
     queryKey: ["research-tasks", report.research.id],
     queryFn: () => api.get<TaskNode[]>(`/api/v1/researches/${report.research.id}/tasks`),
-    refetchInterval: 5000,
   });
   const [tab, setTab] = useState("summary");
   const [regenerating, setRegenerating] = useState(false);

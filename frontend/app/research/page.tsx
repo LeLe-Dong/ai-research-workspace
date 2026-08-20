@@ -1,4 +1,14 @@
+"use client";
+import { Suspense } from "react";
+import { useSearchParams } from "next/navigation";
 import { ResearchList } from "@/features/research/components/research-list";
+import { Skeleton } from "@/components/ui/skeleton";
+
+function ResearchListWithSearch() {
+  const searchParams = useSearchParams();
+  const q = searchParams.get("q") || undefined;
+  return <ResearchList searchQuery={q} />;
+}
 
 export default function ResearchPage() {
   return (
@@ -9,7 +19,15 @@ export default function ResearchPage() {
           管理与查看本工作区的所有研究项目。
         </p>
       </div>
-      <ResearchList />
+      <Suspense fallback={
+        <div className="space-y-1">
+          {Array.from({ length: 5 }).map((_, i) => (
+            <Skeleton key={i} className="h-16 w-full" />
+          ))}
+        </div>
+      }>
+        <ResearchListWithSearch />
+      </Suspense>
     </div>
   );
 }

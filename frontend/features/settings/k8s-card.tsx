@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
-import { Loader2, Server, Trash2, Check, X, Plus, Eye, EyeOff } from "lucide-react";
+import { Loader2, Server, Trash2, Check, X, Plus, Eye, EyeOff, Pencil } from "lucide-react";
 import { api } from "@/lib/api";
 import { toast } from "sonner";
 
@@ -76,6 +76,42 @@ export function K8sSettingsCard() {
     }
   };
 
+  const startEdit = (c: K8sCluster) => {
+    setEditing(c);
+    setName(c.name);
+    setApiServer(c.api_server);
+    setNamespace(c.default_namespace || "airw-research");
+    setSkipTls(c.skip_tls_verify);
+    // Token & CA 不是明文显示 — 留空，保存时空=保留原值
+    setBearerToken("");
+    setCaCert("");
+    setShowAdd(true);
+  };
+
+  const saveEdit = async () => {
+    if (!editing) return;
+    if (!name || !apiServer) {
+      toast.error("请填写名称和 API Server URL");
+      return;
+    }
+    setSaving(true);
+    try {
+      const payload: any = { name, api_server: apiServer, default_namespace: namespace, skip_tls_verify: skipTls };
+      if (bearerToken) payload.bearer_token = bearerToken;
+      if (caCert) payload.ca_cert_pem = caCert;
+      await api.put(`/api/v1/config/k8s/clusters/${editing.id}`, payload);
+      toast.success("集群已更新", { description: editing.name });
+      setShowAdd(false);
+      setEditing(null);
+      resetForm();
+      await load();
+    } catch (e) {
+      toast.error("更新失败", { description: (e as Error).message });
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const test = async (id: number) => {
     setTestingId(id);
     try {
@@ -109,6 +145,7 @@ export function K8sSettingsCard() {
   const resetForm = () => {
     setName(""); setApiServer(""); setBearerToken(""); setCaCert("");
     setNamespace("airw-research"); setSkipTls(false);
+    setEditing(null);
   };
 
   return (
@@ -163,6 +200,15 @@ export function K8sSettingsCard() {
                       size="icon"
                       variant="outline"
                       className="h-7 w-7"
+                      onClick={() => startEdit(c)}
+                      title="编辑"
+                    >
+                      <Pencil className="h-3 w-3" />
+                    </Button>
+                    <Button
+                      size="icon"
+                      variant="outline"
+                      className="h-7 w-7"
                       onClick={() => test(c.id)}
                       disabled={testingId === c.id}
                       title="测试连接"
@@ -185,9 +231,12 @@ export function K8sSettingsCard() {
           </div>
         )}
 
-        {/* Add new cluster form */}
+        {/* Add / Edit cluster form */}
         {showAdd ? (
           <div className="space-y-3 rounded-md border bg-muted/30 p-3">
+            <div className="text-xs font-medium text-muted-foreground">
+              {editing ? `编辑集群: ${editing.name}` : "添加新集群"}
+            </div>
             <div className="grid grid-cols-2 gap-2">
               <div className="space-y-1.5">
                 <Label htmlFor="k8s-name" className="text-xs">名称</Label>
@@ -218,14 +267,16 @@ export function K8sSettingsCard() {
               />
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="k8s-token" className="text-xs">Bearer Token</Label>
+              <Label htmlFor="k8s-token" className="text-xs">
+                Bearer Token {editing && <span className="text-muted-foreground/70">(留空保留现有)</span>}
+              </Label>
               <div className="flex gap-1.5">
                 <Input
                   id="k8s-token"
                   type={showToken ? "text" : "password"}
                   value={bearerToken}
                   onChange={(e) => setBearerToken(e.target.value)}
-                  placeholder="eyJhbGc..."
+                  placeholder={editing ? "留空保留现有 token" : "eyJhbGc..."}
                 />
                 <Button
                   type="button"
@@ -238,12 +289,14 @@ export function K8sSettingsCard() {
               </div>
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="k8s-ca" className="text-xs">CA 证书 (PEM, 可选)</Label>
+              <Label htmlFor="k8s-ca" className="text-xs">
+                CA 证书 (PEM, 可选) {editing && <span className="text-muted-foreground/70">(留空保留)</span>}
+              </Label>
               <textarea
                 id="k8s-ca"
                 value={caCert}
                 onChange={(e) => setCaCert(e.target.value)}
-                placeholder="-----BEGIN CERTIFICATE-----&#10;MIIC...&#10;-----END CERTIFICATE-----"
+                placeholder={editing ? "留空保留现有 CA 证书" : "-----BEGIN CERTIFICATE-----\nMIIC...\n-----END CERTIFICATE-----"}
                 rows={3}
                 className="flex w-full rounded-md border border-input bg-background px-3 py-1.5 text-xs font-mono shadow-sm"
               />
@@ -258,8 +311,12 @@ export function K8sSettingsCard() {
               <span className="text-muted-foreground">跳过 TLS 验证 (仅测试用)</span>
             </label>
             <div className="flex gap-2 pt-1">
-              <Button onClick={add} disabled={saving} size="sm">
-                {saving ? <Loader2 className="h-3 w-3 animate-spin" /> : "保存"}
+              <Button
+                onClick={editing ? saveEdit : add}
+                disabled={saving}
+                size="sm"
+              >
+                {saving ? <Loader2 className="h-3 w-3 animate-spin" /> : (editing ? "保存修改" : "保存")}
               </Button>
               <Button
                 onClick={() => { setShowAdd(false); resetForm(); }}
@@ -272,7 +329,7 @@ export function K8sSettingsCard() {
           </div>
         ) : (
           <Button
-            onClick={() => setShowAdd(true)}
+            onClick={() => { setShowAdd(true); resetForm(); }}
             size="sm"
             variant="outline"
             className="w-full"

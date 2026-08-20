@@ -1,16 +1,21 @@
 "use client";
 import { useState } from "react";
 import Link from "next/link";
-import { FlaskConical, ChevronRight, Trash2, Loader2, Activity, Tag as TagIcon, X } from "lucide-react";
+import { FlaskConical, ChevronRight, Trash2, Loader2, Activity, Eye, Tag as TagIcon, X, Search } from "lucide-react";
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { formatRelativeTime } from "@/lib/utils";
 import { useResearchList, useDeleteResearch } from "../hooks";
 import { useTags } from "@/features/tags/hooks";
 import { toast } from "sonner";
+
+interface ResearchListProps {
+  searchQuery?: string;
+}
 
 const statusVariant = {
   pending: "secondary",
@@ -26,10 +31,10 @@ const priorityVariant = {
 } as const;
 
 const statusLabel = {
-  pending: "Pending",
-  running: "Running",
-  completed: "Completed",
-  failed: "Failed",
+  pending: "待执行",
+  running: "执行中",
+  completed: "已完成",
+  failed: "失败",
 };
 
 const TAG_COLORS: Record<string, string> = {
@@ -40,40 +45,50 @@ const TAG_COLORS: Record<string, string> = {
   purple: "bg-purple-500/15 text-purple-700 border-purple-500/30 dark:text-purple-300",
 };
 
-export function ResearchList() {
+export function ResearchList({ searchQuery }: ResearchListProps) {
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
-  const { data, isLoading } = useResearchList(selectedTag ?? undefined);
+  const { data, isLoading } = useResearchList(selectedTag ?? undefined, searchQuery);
   const { data: allTags = [] } = useTags();
   const del = useDeleteResearch();
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
   const onDelete = async (id: string, title: string) => {
-    if (!confirm(`Delete "${title}"? This cannot be undone.`)) return;
+    if (!confirm(`确定删除「${title}」？此操作不可撤销。`)) return;
     try {
       await del.mutateAsync(id);
-      toast.success("Research deleted");
+      toast.success("研究已删除");
     } catch (err) {
-      toast.error("Delete failed", { description: (err as Error).message });
+      toast.error("删除失败", { description: (err as Error).message });
     }
   };
 
-  // Build a list of unique tags from BOTH the global tag list and the items
-  // so we show tags that exist in the data, even if not in the global list
   const visibleTags = allTags.filter(t => t.count && t.count > 0).slice(0, 12);
+
+  const hasFilter = selectedTag || searchQuery;
+  const resultCount = data?.length ?? 0;
 
   return (
     <Card>
       <CardHeader className="flex-row items-center justify-between space-y-0 pb-3">
-        <CardTitle className="text-base">所有研究</CardTitle>
+        <CardTitle className="text-base">
+          {hasFilter ? `搜索结果（${resultCount} 项）` : "所有研究"}
+        </CardTitle>
         <Button asChild size="sm">
           <Link href="/research/new">新建研究</Link>
         </Button>
       </CardHeader>
-      
-      {/* Tag filter chips */}
-      {visibleTags.length > 0 && (
+
+      {/* Search + Tag filter chips */}
+      {(visibleTags.length > 0 || searchQuery) && (
         <div className="border-b px-4 py-2.5">
           <div className="flex items-center gap-2">
+            {searchQuery && (
+              <div className="flex items-center gap-1.5 rounded-full border bg-muted/50 px-2.5 py-1 text-xs">
+                <Search className="h-3 w-3 text-muted-foreground" />
+                <span className="text-muted-foreground">搜索：</span>
+                <span className="font-medium">{searchQuery}</span>
+              </div>
+            )}
             <TagIcon className="h-3.5 w-3.5 text-muted-foreground" />
             <span className="text-xs text-muted-foreground">筛选：</span>
             <button
@@ -129,9 +144,11 @@ export function ResearchList() {
           </div>
         ) : data && data.length > 0 ? (
           <>
-            {selectedTag && (
+            {hasFilter && (
               <div className="border-b bg-muted/30 px-4 py-1.5 text-[10px] text-muted-foreground">
-                显示 <strong className="text-foreground">{selectedTag}</strong> 标签的 {data.length} 个研究
+                共 {resultCount} 个匹配结果
+                {searchQuery && <span> · 关键词「{searchQuery}」</span>}
+                {selectedTag && <span> · 标签「{selectedTag}」</span>}
               </div>
             )}
             <ul className="divide-y">
@@ -162,9 +179,9 @@ export function ResearchList() {
                               {r.depth}
                             </Badge>
                             {rTags.slice(0, 3).map((t: { id: string; name: string; color: string }) => (
-                              <Badge 
-                                key={t.id} 
-                                variant="outline" 
+                              <Badge
+                                key={t.id}
+                                variant="outline"
                                 className={`h-4 px-1 text-[10px] ${TAG_COLORS[t.color] || TAG_COLORS.blue}`}
                               >
                                 {t.name}
@@ -191,6 +208,20 @@ export function ResearchList() {
                           </Link>
                         </Button>
                       )}
+                      {(r.status === "completed" || r.status === "failed") && (
+                        <Button
+                          asChild
+                          size="sm"
+                          variant="outline"
+                          className="h-7 gap-1 px-2.5 text-xs"
+                          title="查看该次作业的执行快照"
+                        >
+                          <Link href={`/research/${r.id}/execute`}>
+                            <Eye className="h-3 w-3" />
+                            查看运行详情
+                          </Link>
+                        </Button>
+                      )}
                       <Button
                         variant="ghost"
                         size="icon"
@@ -214,10 +245,10 @@ export function ResearchList() {
           <div className="px-4 py-12 text-center">
             <FlaskConical className="mx-auto h-8 w-8 text-muted-foreground/50" />
             <p className="mt-3 text-sm font-medium">
-              {selectedTag ? `暂无「${selectedTag}」标签的研究` : "暂无研究"}
+              {hasFilter ? "未找到匹配的研究" : "暂无研究"}
             </p>
             <p className="mt-1 text-xs text-muted-foreground">
-              {selectedTag ? "试试清除筛选或选择其他标签" : "点击「新建研究」开始第一个研究项目。"}
+              {hasFilter ? "试试调整搜索关键词或清除筛选条件" : "点击「新建研究」开始第一个研究项目。"}
             </p>
           </div>
         )}

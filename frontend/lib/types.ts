@@ -55,6 +55,13 @@ export interface ResearchCreate {
   depth?: Depth;
   priority?: Priority;
   estimated_cost?: number;
+  /** -1 = force off, 0 = auto (default), 1 = force on */
+  requires_k8s_validation?: number;
+  /** 0 = use default 14-dim framework, 1 = inject user's KnowledgeStyle */
+  use_custom_style?: number;
+  /** Phase B: bind to a specific KnowledgeStyle. Null = use active style. */
+  style_id?: string | null;
+  tag_names?: string[];
 }
 
 export interface ResearchSummary extends RecentResearch {}
@@ -93,6 +100,10 @@ export interface TimelineEventOut {
   title: string;
   detail: string;
   sequence: number;
+  // Optional FK to TaskNode. Null when the event is task-less
+  // (LLM traces, mock per-phase events, hermes stdout lines, etc.).
+  // Powers the "click task → filter console" feature.
+  task_id?: string | null;
 }
 
 export interface ArtifactOut {
@@ -112,7 +123,7 @@ export interface ReviewOut {
   suggestions: string;
   threshold: number;
 }
-export type AgentMode = "mock" | "stepfun" | "hermes-researcher";
+export type AgentMode = "mock" | "llm" | "hermes-researcher";
 
 export interface HistoryVersion {
   id: string;

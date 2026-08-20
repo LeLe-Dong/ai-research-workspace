@@ -211,7 +211,8 @@ async def list_models():
         "object": "list",
         "data": [
             {"id": "mock", "object": "model", "owned_by": "airw", "description": "固定剧本演示模式"},
-            {"id": "stepfun", "object": "model", "owned_by": "airw", "description": "stepfun API + DDGS 搜索"},
+            {"id": "llm", "object": "model", "owned_by": "airw",
+             "description": "LLM 模型 — 由 /api/v1/config/llm 提供 provider/base_url/model/api_key（兼容 OpenAI 协议：stepfun / minimax / kimi / openai_compat）"},
             {"id": "hermes-researcher", "object": "model", "owned_by": "airw",
              "description": "Hermes 预研专家 - 14 维度框架"},
         ],

@@ -1,5 +1,6 @@
 """Stepfun LLM client (OpenAI-compatible endpoint)."""
 import os
+import re
 import json
 import logging
 import httpx
@@ -227,6 +228,30 @@ class StepfunClient:
                 lines = lines[:-1]
             candidates.append("\n".join(lines).strip())
 
+        # 2b. Strip thinking blocks (MiniMax-M3 / Claude-style reasoning
+        # that appears BEFORE the actual answer). Handle:
+        #   - Complete <think>...</think> (full block)
+        #   - Truncated <think>... (no closing tag, response cut by max_tokens)
+        #   - Inline <think>...</think>...next <think> (multiple blocks)
+        #   - Mixed: thinking + JSON, e.g. "<think>...</think>\n{...}"
+        # Use multiple strategies and add each cleaned version as candidate.
+        cleaned = text
+        # 1. Repeatedly strip complete think blocks
+        for _ in range(5):
+            new = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL)
+            if new == cleaned:
+                break
+            cleaned = new
+        cleaned = cleaned.strip()
+        # 2. If still has unclosed <think>, strip to next line break or JSON
+        if "<think>" in cleaned and "</think>" not in cleaned:
+            cleaned = re.sub(r"<think>[^\n]*(\n.*?)*?(?=[\{\[]|\Z)", "", cleaned, flags=re.DOTALL).strip()
+            # As a fallback, just strip everything from <think> to EOF
+            if "<think>" in cleaned:
+                cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.DOTALL).strip()
+        if cleaned and cleaned != text.strip():
+            candidates.append(cleaned)
+
         # 3. Find first '{' and matching balanced '}'
         first = text.find("{")
         if first >= 0:
@@ -268,5 +293,5 @@ class StepfunClient:
             except json.JSONDecodeError as e:
                 last_err = e
 
-        logger.error("LLM JSON parse failed: %s / text=%s", last_err, text[:500])
+        logger.error("LLM JSON parse failed: %s / text=%s", last_err, text[:800])
         raise LLMError(f"Bad JSON from LLM: {last_err}") from last_err

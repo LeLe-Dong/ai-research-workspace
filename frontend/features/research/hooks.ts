@@ -3,10 +3,15 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { researchApi } from "./api";
 import type { ResearchCreate, ResearchDetail } from "@/lib/types";
 
-export function useResearchList(tag?: string) {
+function resolveApiBase(): string {
+  if (typeof window !== "undefined") return window.location.origin;
+  return "";
+}
+
+export function useResearchList(tag?: string, q?: string) {
   return useQuery({
-    queryKey: ["researches", tag ?? "all"],
-    queryFn: () => researchApi.list({ tag }),
+    queryKey: ["researches", tag ?? "all", q ?? ""],
+    queryFn: () => researchApi.list({ tag, q }),
   });
 }
 
@@ -44,9 +49,7 @@ export function useStartResearch(id: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async () => {
-      const apiBase = (typeof window !== "undefined"
-        ? `${window.location.protocol}//${window.location.hostname}:8003`
-        : "http://127.0.0.1:8003");
+      const apiBase = resolveApiBase();
       const r = await fetch(`${apiBase}/api/v1/researches/${id}/start`, {
         method: "POST",
       });
@@ -56,10 +59,8 @@ export function useStartResearch(id: string) {
       }
       return r.json();
     },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["research", id] });
-      qc.invalidateQueries({ queryKey: ["researches"] });
-      qc.invalidateQueries({ queryKey: ["dashboard"] });
-    },
+    // No onSuccess invalidation — the execute page fetches its own data,
+    // and SSE pushes live updates. Invalidate here would cause a burst of
+    // redundant refetches that compete with the page transition.
   });
 }

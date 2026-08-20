@@ -19,10 +19,13 @@ interface LLMConfig {
   updated_at: string | null;
 }
 
+// α 完全自定义：provider 切换不强制覆盖 base_url/model。
+// PROVIDER_PRESETS 只作为初始 placeholder / 文档示例，不用于 onProviderChange。
 const PROVIDER_PRESETS: Record<string, { base_url: string; default_model: string }> = {
   stepfun: { base_url: "https://api.stepfun.com/step_plan/v1", default_model: "step-3.7-flash" },
   minimax: { base_url: "https://api.minimaxi.com/v1", default_model: "MiniMax-Text-01" },
   openai_compat: { base_url: "https://api.openai.com/v1", default_model: "gpt-4o-mini" },
+  kimi: { base_url: "https://api.moonshot.cn/v1", default_model: "moonshot-v1-8k" },
 };
 
 export function LLMSettingsCard() {
@@ -57,12 +60,9 @@ export function LLMSettingsCard() {
   useEffect(() => { load(); }, []);
 
   const onProviderChange = (p: string) => {
+    // α 完全自定义：只更新 provider 字段，base_url/model 由用户自行填写。
+    // provider 仅作为路由标签，backend 决定是否走 stepfun_* override 路径。
     setProvider(p);
-    const preset = PROVIDER_PRESETS[p];
-    if (preset) {
-      setBaseUrl(preset.base_url);
-      setModel(preset.default_model);
-    }
   };
 
   const save = async () => {
@@ -130,6 +130,7 @@ export function LLMSettingsCard() {
                 <option value="stepfun">Stepfun (step-3.7-flash)</option>
                 <option value="minimax">MiniMax (国产)</option>
                 <option value="openai_compat">OpenAI 兼容 (vLLM / Ollama / 自建)</option>
+                <option value="kimi">Kimi (月之暗面 Moonshot)</option>
               </select>
             </div>
             <div className="space-y-2">

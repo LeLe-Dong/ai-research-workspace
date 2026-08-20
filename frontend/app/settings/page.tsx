@@ -82,7 +82,7 @@ export default function SettingsPage() {
     queryFn: () => api.get<AgentModeInfo>("/api/v1/admin/agent-mode"),
     refetchInterval: countdown !== null ? 1500 : 10_000,
   });
-  const { data: health } = useQuery({
+  const { data: health, isError: healthError, isLoading: healthLoading } = useQuery({
     queryKey: ["health"],
     queryFn: () => api.get<HealthData>("/health"),
     refetchInterval: 10_000,
@@ -193,14 +193,28 @@ export default function SettingsPage() {
           <div className="grid grid-cols-2 gap-3">
             <div>
               <p className="text-xs text-muted-foreground">服务名</p>
-              <p className="font-mono">{safe(health?.service)}</p>
+              <p className="font-mono">{safe(health?.service, "未取得")}</p>
             </div>
             <div>
               <p className="text-xs text-muted-foreground">状态</p>
               <p>
-                <Badge variant={health?.status === "ok" ? "success" : "destructive"} className="h-4 px-1.5 text-[10px]">
-                  {safe(health?.status, "连接中...")}
-                </Badge>
+                {health?.status === "ok" ? (
+                  <Badge variant="success" className="h-4 px-1.5 text-[10px]">
+                    运行中
+                  </Badge>
+                ) : healthError ? (
+                  <Badge variant="destructive" className="h-4 px-1.5 text-[10px]">
+                    异常
+                  </Badge>
+                ) : healthLoading ? (
+                  <Badge variant="outline" className="h-4 px-1.5 text-[10px] text-muted-foreground">
+                    加载中
+                  </Badge>
+                ) : (
+                  <Badge variant="destructive" className="h-4 px-1.5 text-[10px]">
+                    异常
+                  </Badge>
+                )}
               </p>
             </div>
             <div>
@@ -254,7 +268,7 @@ export default function SettingsPage() {
               <p key={m}>
                 <span className="font-mono font-medium text-foreground">{m}</span>
                 {m === "mock" && "：固定剧本（4 秒），无需 API key。Demo 模式。"}
-                {m === "stepfun" && "：调用 step-3.7-flash + DDGS 搜索。需要 AIRW_STEPFUN_API_KEY。"}
+                {m === "llm" && "：调用下方「LLM 模型」卡片配置的 provider（stepfun / kimi / minimax / openai_compat）。所有 OpenAI 兼容协议。"}
                 {m === "hermes-researcher" && "：Shell out 到 hermes chat --cli。复用 hermes 自带 skill 体系（arxiv / feeds）。"}
               </p>
             ))}

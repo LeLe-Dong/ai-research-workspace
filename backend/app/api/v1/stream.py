@@ -8,7 +8,15 @@ Wire format (each line a JSON-encoded envelope):
   data: {"type": "heartbeat", "ts": "..."}
   data: {"type": "end", "reason": "..."}
 
-Client connects once; receives catch-up from since=0, then live updates every 1s.
+Client connects once; receives catch-up from since=0, then live updates.
+
+Hybrid delivery:
+- Primary: in-memory event_bus (per-research asyncio.Queue) the executor
+  publishes to the moment it commits a row. This gives true real-time feel
+  (sub-second latency) and survives burst writes.
+- Secondary: DB poll every 250ms as a safety net for events missed during
+  long-running transactions, lost task-bus envelopes, or late SSE clients
+  that connect after the executor has finished.
 """
 import asyncio
 import json
@@ -21,6 +29,7 @@ from sqlalchemy import select
 
 from app.db.database import get_session
 from app.db.models import Artifact, Research, Task, TimelineEvent
+from app.services.event_bus import event_bus
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/researches", tags=["stream"])
@@ -83,7 +92,12 @@ def _sse(payload: dict) -> str:
 
 @router.get("/{research_id}/stream")
 async def stream(research_id: str, since: int = Query(default=0, ge=0)):
-    """SSE stream. Waits for agent to materialize rows, emits snapshot, then polls."""
+    """SSE stream. Wait for agent materialization, emit catch-up, then live updates.
+
+    Real-time path: executor publishes to `event_bus` per commit → SSE picks
+    up the queue immediately. DB poll at 250ms is a safety net for anything
+    missed (transaction boundaries, lost wakeups, late clients).
+    """
     last_seq = since
     last_status = None
     last_artifact_ids: set[str] = set()
@@ -122,12 +136,44 @@ async def stream(research_id: str, since: int = Query(default=0, ge=0)):
             start = asyncio.get_event_loop().time()
             max_duration = 300.0
 
+            # Hybrid loop: drain event_bus quickly (≤200ms per item via
+            # wait_for) but periodically (every 250ms) poll DB to catch
+            # anything the bus missed.
+            bus_iter = event_bus.subscribe(research_id).__aiter__()
             while True:
-                await asyncio.sleep(1.0)
                 if asyncio.get_event_loop().time() - start > max_duration:
                     yield _sse({"type": "end", "reason": "max_duration"})
                     return
 
+                # 1) Drain one bus item (with 250ms budget so we don't block
+                # the DB poll indefinitely on a quiet executor).
+                bus_pushed = False
+                try:
+                    kind, payload = await asyncio.wait_for(
+                        bus_iter.__anext__(), timeout=0.25
+                    )
+                    if kind == "__end__":
+                        yield _sse({"type": "end", "reason": payload.get("reason", "closed")})
+                        return
+                    if kind == "__heartbeat__":
+                        # Don't emit a frontend heartbeat; just loop.
+                        bus_pushed = False
+                    elif kind == "timeline":
+                        yield _sse({"type": "timeline", "event": payload})
+                        last_seq = max(last_seq, payload.get("sequence", 0))
+                        bus_pushed = True
+                    elif kind == "artifact":
+                        yield _sse({"type": "artifact", "artifact": payload})
+                        last_artifact_ids.add(payload.get("id", ""))
+                        bus_pushed = True
+                except asyncio.TimeoutError:
+                    # No bus events this tick; fall through to DB poll.
+                    pass
+                except StopAsyncIteration:
+                    pass
+
+                # 2) Safety-net DB poll (always, even after bus event, to
+                # catch anything the executor published before SSE connected).
                 snap = await _fetch_state(research_id, last_seq)
                 if "error" in snap:
                     return
@@ -155,7 +201,10 @@ async def stream(research_id: str, since: int = Query(default=0, ge=0)):
                     yield _sse({"type": "end", "reason": "completed"})
                     return
 
-                yield _sse({"type": "heartbeat", "ts": datetime.utcnow().isoformat()})
+                # Heartbeat every ~1s to keep the connection alive.
+                if not bus_pushed:
+                    yield _sse({"type": "heartbeat", "ts": datetime.utcnow().isoformat()})
+                    await asyncio.sleep(0.25)
         except asyncio.CancelledError:
             raise
         except Exception as e:
