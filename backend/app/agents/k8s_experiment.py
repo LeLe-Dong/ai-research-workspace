@@ -55,6 +55,64 @@ MAX_WORKLOADS = 10
 MAX_CHECKS = 15
 
 
+def _validate_and_fix_workload_yaml(w: dict) -> dict:
+    """Validate and auto-fix common LLM-generated workload YAML issues.
+
+    Returns the workload dict with YAML fixed if possible. Logs warnings
+    for unfixable issues.
+    """
+    import yaml as _yaml
+    yaml_str = w.get("yaml", "")
+    if not yaml_str:
+        return w
+
+    try:
+        docs = list(_yaml.safe_load_all(yaml_str))
+    except _yaml.YAMLError as exc:
+        logger.warning("workload %s has invalid YAML: %s", w.get("name"), exc)
+        w["_yaml_error"] = str(exc)
+        return w
+
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        kind = doc.get("kind", "")
+        spec = doc.get("spec", {})
+
+        if kind == "Deployment":
+            template = spec.get("template", {}).get("spec", {})
+            containers = template.get("containers", [])
+            for c in containers:
+                # Ensure resources are set — LLM often omits them
+                if "resources" not in c:
+                    c["resources"] = {"requests": {"cpu": "50m", "memory": "64Mi"},
+                                      "limits": {"cpu": "200m", "memory": "256Mi"}}
+                    logger.info("workload %s container %s: added default resources", w.get("name"), c.get("name"))
+                # Ensure readinessProbe for long-running containers
+                if "readinessProbe" not in c:
+                    image = c.get("image", "")
+                    probe = None
+                    if "mysql" in image:
+                        probe = {"exec": {"command": ["mysqladmin", "ping", "-h", "127.0.0.1", "-p", "airwtest123"]},
+                                 "initialDelaySeconds": 30, "periodSeconds": 10}
+                    elif "redis" in image:
+                        probe = {"exec": {"command": ["redis-cli", "ping"]},
+                                 "initialDelaySeconds": 10, "periodSeconds": 5}
+                    elif "postgres" in image:
+                        probe = {"exec": {"command": ["pg_isready", "-U", "postgres"]},
+                                 "initialDelaySeconds": 15, "periodSeconds": 5}
+                    elif "mongo" in image:
+                        probe = {"exec": {"command": ["mongosh", "--eval", "db.adminCommand('ping')"]},
+                                 "initialDelaySeconds": 15, "periodSeconds": 5}
+                    if probe:
+                        c["readinessProbe"] = probe
+                        logger.info("workload %s container %s: added readinessProbe", w.get("name"), c.get("name"))
+
+    # Re-serialize the fixed YAML
+    w["yaml"] = _yaml.dump_all([d for d in docs if isinstance(d, dict)], default_flow_style=False)
+    return w
+
+
 def _to_short_ref(image: str) -> str:
     """Reduce an image ref to `<name>:<tag>` for console display."""
     from app.agents.k8s_image import _to_short_name
@@ -1033,7 +1091,31 @@ async def _check_pod_log_match(kc_path: str, ns: str, target: str, substring: st
     seen = ""
     last_seen = ""
     last_wait_ts = 0.0
+    container_error = ""
+    crash_start_ts = 0.0
     while asyncio.get_event_loop().time() < deadline:
+        # First check pod status to detect CrashLoopBackOff / Error early
+        rc_st, st_out, _ = await _kubectl_async(
+            ["--kubeconfig", kc_path, "get", "pods", "-n", ns, "-l", selector,
+             "-o", "jsonpath={.items[0].status.containerStatuses[0].state}"],
+            timeout=10,
+        )
+        if rc_st == 0 and st_out:
+            if "waiting" in st_out and "CrashLoopBackOff" in st_out:
+                if container_error != "CrashLoopBackOff":
+                    container_error = "CrashLoopBackOff"
+                    crash_start_ts = asyncio.get_event_loop().time()
+                # Fast-fail: if CrashLoopBackOff persists for 30s, don't wait full timeout
+                elif asyncio.get_event_loop().time() - crash_start_ts > 30:
+                    return {"passed": False,
+                            "evidence": f"Pod 持续 CrashLoopBackOff 超过 30s，快速失败; 状态: {st_out[:200]}"}
+            elif "waiting" in st_out and "Error" in st_out:
+                container_error = "Error"
+            elif "terminated" in st_out:
+                container_error = "Terminated"
+            else:
+                container_error = ""
+
         rc, out, err = await _kubectl_async(
             ["--kubeconfig", kc_path, "logs", "-n", ns, "-l", selector, "--tail=200"],
             timeout=10,
@@ -1042,8 +1124,6 @@ async def _check_pod_log_match(kc_path: str, ns: str, target: str, substring: st
             return {"passed": True, "evidence": f"日志包含 '{substring}'"}
         seen = out or ""
         if progress_cb is not None:
-            # Show the FULL log tail (not just 6 lines) so the execution
-            # process — command output, progress lines, errors — is visible.
             tail = "\n".join(seen.splitlines()[-40:])
             if tail and tail != last_seen:
                 last_seen = tail
@@ -1052,9 +1132,17 @@ async def _check_pod_log_match(kc_path: str, ns: str, target: str, substring: st
                 now = asyncio.get_event_loop().time()
                 if now - last_wait_ts >= 15:
                     last_wait_ts = now
-                    await progress_cb(f"[pod_log_match] 暂无日志，等待 '{substring}' 出现...")
+                    if container_error:
+                        await progress_cb(f"[pod_log_match] Pod 状态: {container_error}，日志可能不可用，等待 '{substring}' ...")
+                    else:
+                        await progress_cb(f"[pod_log_match] 暂无日志，等待 '{substring}' 出现...")
         await asyncio.sleep(3)
-    return {"passed": False, "evidence": f"日志中未出现 '{substring}'; 尾部: {seen[:200]}"}
+    evidence = f"日志中未出现 '{substring}'"
+    if container_error:
+        evidence += f"; Pod 状态: {container_error}"
+    if seen:
+        evidence += f"; 尾部: {seen[:300]}"
+    return {"passed": False, "evidence": evidence}
 
 
 async def _check_http_ok(kc_path: str, ns: str, url: str, expect: str, timeout_sec: int) -> dict:
@@ -1144,6 +1232,9 @@ async def run_experiment(
     _failed_workloads: set[str] = set()
     try:
         for i, w in enumerate(plan["workloads"]):
+            # Validate and auto-fix common LLM YAML issues before applying
+            w = _validate_and_fix_workload_yaml(w)
+
             yield AgentEvent(phase="validate", level="info",
                              title=f"应用工作负载 {i+1}/{len(plan['workloads'])}: {w['name']}",
                              detail=f"{w['kind']} · {w['image'] or '(见 yaml)'} · replicas={w['replicas']}",
@@ -1188,8 +1279,23 @@ async def run_experiment(
                                      task_id="task-10")
             else:
                 _failed_workloads.add(w["name"])
+                # Get detailed error info from kubectl describe
+                describe_detail = ""
+                try:
+                    rc_d, out_d, _ = await _kubectl_async(
+                        ["--kubeconfig", kc_path, "describe", "deployment", w["name"], "-n", ns],
+                        timeout=10,
+                    )
+                    if rc_d == 0 and out_d:
+                        # Extract last 10 lines of describe output for brevity
+                        describe_detail = "\n".join(out_d.splitlines()[-10:])
+                except Exception:
+                    pass
+                error_msg = err[:300]
+                if describe_detail:
+                    error_msg += f"\n--- describe ---\n{describe_detail[:300]}"
                 yield AgentEvent(phase="validate", level="error",
-                                 title=f"应用 {w['name']} 失败", detail=err[:200],
+                                 title=f"应用 {w['name']} 失败", detail=error_msg,
                                  task_id="task-10")
 
         # 4. Run checks — each check runs as a background task that streams
