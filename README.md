@@ -30,26 +30,50 @@
 
 ## 产品截图
 
-### 仪表盘
-![Dashboard](docs/screenshots/dashboard.png)
+### 1. 仪表盘（Dashboard）
+系统概览：研究统计、最近研究、Agent 状态、运行中的任务。
 
-### 研究列表
-![Research List](docs/screenshots/research-list.png)
+![Dashboard](docs/screenshots/01-dashboard.png)
 
-### 研究详情
-![Research Detail](docs/screenshots/research-detail.png)
+### 2. 研究列表（Research List）
+所有研究项：标题、状态、深度、标签、创建时间。支持搜索和标签筛选。
 
-### 执行视图
-![Execute View](docs/screenshots/research-detail.png)
+![Research List](docs/screenshots/02-research-list.png)
 
-### 研究报告
-![Report](docs/screenshots/report.png)
+### 3. 新建研究（New Research）
+创建研究表单：标题、目标、约束条件、深度选择、K8s 验证开关、标签选择。支持 AI 扩展目标。
 
-### 研究主题
-![Topics](docs/screenshots/topics.png)
+![New Research](docs/screenshots/03-new-research.png)
 
-### 系统设置
-![Settings](docs/screenshots/settings.png)
+### 4. 研究详情（Research Detail）
+单个研究详情：目标、约束、期望输出、标签管理、操作按钮（执行/报告/删除）。
+
+![Research Detail](docs/screenshots/04-research-detail.png)
+
+### 5. 执行视图（Execute View）
+三栏布局实时执行：任务树 | 时间线 | 产物面板。SSE 实时推送进度。
+
+![Execute View](docs/screenshots/05-execute-view.png)
+
+### 6. 研究报告（Report）
+12 节结构化 Markdown 报告：执行摘要、对比矩阵、雷达图评分、实证数据。支持下载。
+
+![Report](docs/screenshots/06-report.png)
+
+### 7. 研究主题（Topics）
+迭代研究管理：基线对比、分数趋势、每轮迭代的 K8s 验证结果。
+
+![Topics](docs/screenshots/07-topics.png)
+
+### 8. 系统设置（Settings）
+Agent 模式切换（Mock/LLM/Hermes）、LLM 配置、K8s 集群管理、快捷键参考。
+
+![Settings](docs/screenshots/08-settings.png)
+
+### 9. 知识库（Knowledge）
+文档上传、风格提取、风格激活。上传预研文档，AI 自动提取写作风格。
+
+![Knowledge](docs/screenshots/09-knowledge.png)
 
 ---
 
