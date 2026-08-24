@@ -158,9 +158,14 @@ def _validate_and_fix_workload_yaml(w: dict) -> dict:
                             cmd = cmd.replace("$(($RANDOM+3))", "3")
                             c["args"] = [cmd]
                             logger.info("workload %s: fixed MySQL $(()) syntax", w.get("name"))
-                        # Fix -pAirwtest123 → -p airwtest123 (space missing)
-                        if "-pAirwtest123" in cmd:
-                            cmd = cmd.replace("-pAirwtest123", "-p airwtest123")
+                        # Fix -pPassword → -p Password (space missing)
+                        # Match -p followed by lowercase letters (password)
+                        import re as _re_fix
+                        cmd_before = cmd
+                        cmd = _re_fix.sub(r'-p([a-z]\w+)', r'-p \1', cmd)
+                        # Also handle -pAirwtest123 (mixed case)
+                        cmd = _re_fix.sub(r'-p([A-Z]\w+)', r'-p \1', cmd)
+                        if cmd != cmd_before:
                             c["args"] = [cmd]
                             logger.info("workload %s: fixed MySQL -p syntax", w.get("name"))
 
@@ -837,6 +842,11 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
     workloads = (plan.get("workloads") or [])[:MAX_WORKLOADS]
     checks = (plan.get("checks") or [])[:MAX_CHECKS]
 
+    # Auto-mount ConfigMaps that match Deployments (e.g. mysql-master-init
+    # → mysql-master). Without this, LLM-generated ConfigMaps go unused.
+    # MUST be called BEFORE building cleaned_workloads so the mounted YAML is included.
+    _mount_configmaps_if_present(plan)
+
     cleaned_workloads = []
     for w in workloads:
         if not isinstance(w, dict):
@@ -951,10 +961,6 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
 
     if auto_generated:
         cleaned_workloads = cleaned_workloads + auto_generated[:MAX_WORKLOADS - len(cleaned_workloads)]
-
-    # Auto-mount ConfigMaps that match Deployments (e.g. mysql-master-init
-    # → mysql-master). Without this, LLM-generated ConfigMaps go unused.
-    _mount_configmaps_if_present(plan)
 
     cleaned_checks = []
     for c in checks:
