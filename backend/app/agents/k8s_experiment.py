@@ -62,16 +62,72 @@ def _validate_and_fix_workload_yaml(w: dict) -> dict:
     for unfixable issues.
     """
     import yaml as _yaml
+    import re as _re
     yaml_str = w.get("yaml", "")
     if not yaml_str:
         return w
 
+    # Pre-fix common YAML syntax issues before parsing
+    # 1. Fix nested quotes in args: ["cmd -e "text"" ] → ["cmd -e 'text'"]
+    yaml_str = _re.sub(r'args:\s*\[(.*?)\]', lambda m: 'args: [' + m.group(1).replace('"', "'") + ']', yaml_str)
+
     try:
         docs = list(_yaml.safe_load_all(yaml_str))
     except _yaml.YAMLError as exc:
-        logger.warning("workload %s has invalid YAML: %s", w.get("name"), exc)
-        w["_yaml_error"] = str(exc)
-        return w
+        logger.warning("workload %s has invalid YAML after pre-fix: %s", w.get("name"), exc)
+        # Try to extract command/args from raw YAML string
+        try:
+            # Extract command and args using regex
+            cmd_match = _re.search(r'command:\s*\[(.*?)\]', yaml_str)
+            args_match = _re.search(r'args:\s*\[(.*?)\]', yaml_str)
+            image_match = _re.search(r'image:\s*(\S+)', yaml_str)
+            name_match = _re.search(r'name:\s*(\S+)', yaml_str)
+
+            if image_match:
+                image = image_match.group(1).strip('"\'')
+                name = name_match.group(1).strip('"\'') if name_match else w.get("name", "unknown")
+                cmd = cmd_match.group(1).strip('"\'') if cmd_match else '/bin/sh -c'
+                args = args_match.group(1).strip('"\'') if args_match else 'echo "hello"'
+
+                # Fix common issues in the command
+                if "mysql" in image.lower():
+                    # Fix -p password spacing
+                    args = _re.sub(r'-p(\w+)', r'-p \1', args)
+                    # Fix $(()) syntax
+                    args = _re.sub(r'\$\(\(\$RANDOM\+(\d+)\)\)', r'\1', args)
+
+                # Generate a clean YAML
+                clean_yaml = {
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {"name": name, "labels": {"app": name}},
+                    "spec": {
+                        "replicas": 1,
+                        "selector": {"matchLabels": {"app": name}},
+                        "template": {
+                            "metadata": {"labels": {"app": name}},
+                            "spec": {
+                                "containers": [{
+                                    "name": name,
+                                    "image": image,
+                                    "command": ["/bin/sh", "-c"],
+                                    "args": [args],
+                                    "resources": {"requests": {"cpu": "50m", "memory": "64Mi"},
+                                                  "limits": {"cpu": "200m", "memory": "256Mi"}},
+                                }]
+                            }
+                        }
+                    }
+                }
+                w["yaml"] = _yaml.dump(clean_yaml, default_flow_style=False)
+                logger.info("workload %s: regenerated YAML from raw extraction", name)
+                return w
+            else:
+                logger.warning("workload %s: cannot extract image from invalid YAML", w.get("name"))
+                return w
+        except Exception as e:
+            logger.warning("workload %s: failed to extract from invalid YAML: %s", w.get("name"), e)
+            return w
 
     for doc in docs:
         if not isinstance(doc, dict):
@@ -717,6 +773,7 @@ async def _ask_hermes_for_experiment(
         raise RuntimeError(f"hermes exited rc={proc.returncode}")
 
     text = out_b.decode("utf-8", errors="replace")
+    logger.info("hermes k8s-expert raw output length: %d chars", len(text))
 
     # Strip the decorative box / noise, then find the JSON object.
     try:
@@ -730,7 +787,45 @@ async def _ask_hermes_for_experiment(
     if first < 0 or last <= first:
         raise RuntimeError("hermes did not return a JSON object")
     payload = cleaned[first:last + 1]
-    plan = json.loads(payload)
+    logger.info("hermes k8s-expert JSON payload length: %d chars", len(payload))
+    logger.debug("hermes k8s-expert JSON payload: %s", payload[:500])
+
+    # Try to parse JSON, with fallback for common LLM output issues
+    try:
+        plan = json.loads(payload)
+    except json.JSONDecodeError as e:
+        logger.warning("JSON parse failed (%s), attempting to fix common issues", e)
+        # Try to fix common issues:
+        # 1. Unescaped control characters in YAML strings
+        # 2. Trailing commas
+        import re as _re
+        fixed_payload = payload
+        # Fix unescaped newlines in YAML strings (inside "yaml":"..." values)
+        # This is tricky because we need to only fix YAML content, not the entire JSON
+        # Strategy: find all "yaml":"..." patterns and fix them
+        def fix_yaml_in_json(match):
+            prefix = match.group(1)  # "yaml":"
+            yaml_content = match.group(2)
+            suffix = match.group(3)  # "
+            # Fix unescaped newlines
+            yaml_content = yaml_content.replace('\n', '\\n')
+            # Fix unescaped tabs
+            yaml_content = yaml_content.replace('\t', '\\t')
+            # Fix unescaped carriage returns
+            yaml_content = yaml_content.replace('\r', '\\r')
+            return prefix + yaml_content + suffix
+
+        # Match "yaml":"..." patterns (non-greedy)
+        fixed_payload = _re.sub(r'("yaml"\s*:\s*")((?:[^"\\]|\\.)*?)(")', fix_yaml_in_json, fixed_payload)
+
+        try:
+            plan = json.loads(fixed_payload)
+            logger.info("JSON parse succeeded after fixing control characters")
+        except json.JSONDecodeError as e2:
+            logger.warning("JSON parse still failed after fix (%s)", e2)
+            # Last resort: try to extract workloads using regex
+            raise RuntimeError(f"hermes JSON is invalid: {e2}")
+
     if not isinstance(plan, dict):
         raise RuntimeError("hermes JSON is not an object")
     return plan
@@ -747,10 +842,13 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
         if not isinstance(w, dict):
             continue
         w_yaml = w.get("yaml", "")
+        w_name = w.get("name", "unknown")
+        logger.info("Validating workload '%s': yaml length=%d", w_name, len(w_yaml))
         # Namespace safety: rewrite any namespace in the manifest to the
         # experiment namespace, then assert it's the allowed one.
         try:
             docs = list(yaml.safe_load_all(w_yaml))
+            logger.info("Workload '%s': parsed %d YAML docs", w_name, len(docs))
             # A single workload entry may contain MULTIPLE yaml documents
             # (LLM sometimes bundles Service + Deployment into one "yaml"
             # string). Expand them into separate workload entries.
