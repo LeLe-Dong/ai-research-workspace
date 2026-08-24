@@ -88,20 +88,39 @@ def _validate_and_fix_workload_yaml(w: dict) -> dict:
                     c["resources"] = {"requests": {"cpu": "50m", "memory": "64Mi"},
                                       "limits": {"cpu": "200m", "memory": "256Mi"}}
                     logger.info("workload %s container %s: added default resources", w.get("name"), c.get("name"))
+
+                # Fix common MySQL command issues
+                image = c.get("image", "")
+                if "mysql" in image.lower():
+                    args = c.get("args", [])
+                    if args and isinstance(args[0], str):
+                        cmd = args[0]
+                        # Fix $(()) shell syntax — replace with fixed value
+                        if "$((" in cmd:
+                            cmd = cmd.replace("$(($RANDOM+1))", "1")
+                            cmd = cmd.replace("$(($RANDOM+2))", "2")
+                            cmd = cmd.replace("$(($RANDOM+3))", "3")
+                            c["args"] = [cmd]
+                            logger.info("workload %s: fixed MySQL $(()) syntax", w.get("name"))
+                        # Fix -pAirwtest123 → -p airwtest123 (space missing)
+                        if "-pAirwtest123" in cmd:
+                            cmd = cmd.replace("-pAirwtest123", "-p airwtest123")
+                            c["args"] = [cmd]
+                            logger.info("workload %s: fixed MySQL -p syntax", w.get("name"))
+
                 # Ensure readinessProbe for long-running containers
                 if "readinessProbe" not in c:
-                    image = c.get("image", "")
                     probe = None
-                    if "mysql" in image:
-                        probe = {"exec": {"command": ["mysqladmin", "ping", "-h", "127.0.0.1", "-p", "airwtest123"]},
-                                 "initialDelaySeconds": 30, "periodSeconds": 10}
-                    elif "redis" in image:
+                    if "mysql" in image.lower():
+                        probe = {"exec": {"command": ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p", "airwtest123"]},
+                                 "initialDelaySeconds": 60, "periodSeconds": 10}
+                    elif "redis" in image.lower():
                         probe = {"exec": {"command": ["redis-cli", "ping"]},
                                  "initialDelaySeconds": 10, "periodSeconds": 5}
-                    elif "postgres" in image:
+                    elif "postgres" in image.lower():
                         probe = {"exec": {"command": ["pg_isready", "-U", "postgres"]},
                                  "initialDelaySeconds": 15, "periodSeconds": 5}
-                    elif "mongo" in image:
+                    elif "mongo" in image.lower():
                         probe = {"exec": {"command": ["mongosh", "--eval", "db.adminCommand('ping')"]},
                                  "initialDelaySeconds": 15, "periodSeconds": 5}
                     if probe:
@@ -205,7 +224,7 @@ def _make_mysql_workload(name: str, app_label: str, namespace: str, image: str) 
                             {"name": "MYSQL_DATABASE", "value": "testdb"},
                         ],
                         "command": ["/bin/sh", "-c"],
-                        "args": ["mysqld --server-id=$((RANDOM+1)) --log-bin=mysql-bin --binlog_format=ROW --gtid_mode=ON --enforce-gtid-consistency=ON --read_only=OFF --default-authentication-plugin=mysql_native_password"],
+                        "args": ["mysqld --server-id=1 --log-bin=mysql-bin --binlog_format=ROW --gtid_mode=ON --enforce-gtid-consistency=ON --read_only=OFF --default-authentication-plugin=mysql_native_password"],
                         "resources": {"requests": {"cpu": "200m", "memory": "256Mi"},
                                        "limits": {"cpu": "500m", "memory": "512Mi"}},
                         "readinessProbe": {
@@ -651,7 +670,9 @@ async def _ask_hermes_for_experiment(
         "5. mysql 容器需设置 MYSQL_ROOT_PASSWORD=yes 或 MYSQL_ALLOW_EMPTY_PASSWORD=yes。\n"
         "6. 资源请求 cpu<=500m, memory<=512Mi。\n"
         "7. checks 必须与 workloads 一一对应，不要引用未部署的资源。\n"
-        "8. 优先用 pod_log_match 进行功能验证（匹配 Pod 输出中的关键结果），pod_ready 仅作辅助。\n\n"
+        "8. 优先用 pod_log_match 进行功能验证（匹配 Pod 输出中的关键结果），pod_ready 仅作辅助。\n"
+        "9. MySQL 启动命令中不要使用 $(()) shell 语法，直接用固定数字（如 --server-id=1）。\n"
+        "10. mysqladmin 命令的 -p 参数和密码之间必须有空格（如 -p airwtest123，不是 -pairwtest123）。\n\n"
         "JSON格式：\n"
         "{\"experiment\":{\"name\":\"x\",\"namespace\":\"" + namespace + "\"},"
         "\"workloads\":[{\"name\":\"x\",\"kind\":\"Deployment\",\"image\":\"registry.adms.io:31542/library/redis:7.0.4\",\"replicas\":1,\"yaml\":\"...\"}],"
