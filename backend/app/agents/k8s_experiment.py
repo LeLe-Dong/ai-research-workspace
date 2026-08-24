@@ -159,12 +159,12 @@ def _validate_and_fix_workload_yaml(w: dict) -> dict:
                             c["args"] = [cmd]
                             logger.info("workload %s: fixed MySQL $(()) syntax", w.get("name"))
                         # Fix -pPassword → -p Password (space missing)
-                        # Match -p followed by lowercase letters (password)
+                        # Only match -p at start of string or after space, NOT in --flags
+                        # This avoids breaking --default-authentication-plugin etc.
                         import re as _re_fix
                         cmd_before = cmd
-                        cmd = _re_fix.sub(r'-p([a-z]\w+)', r'-p \1', cmd)
-                        # Also handle -pAirwtest123 (mixed case)
-                        cmd = _re_fix.sub(r'-p([A-Z]\w+)', r'-p \1', cmd)
+                        # Match -p followed by letter, preceded by space/start, not followed by =
+                        cmd = _re_fix.sub(r'(?:^|\s)-p([a-zA-Z]\w+)(?!=)', lambda m: m.group(0).replace('-p' + m.group(1), '-p ' + m.group(1)), cmd)
                         if cmd != cmd_before:
                             c["args"] = [cmd]
                             logger.info("workload %s: fixed MySQL -p syntax", w.get("name"))
