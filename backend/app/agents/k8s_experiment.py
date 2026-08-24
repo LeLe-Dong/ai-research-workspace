@@ -1539,6 +1539,7 @@ async def run_experiment(
             applied_with_cmd.append({
                 "name": w["name"], "kind": w["kind"], "image": w["image"], "rc": w["rc"],
                 "command": cmd_txt,
+                "yaml": w.get("yaml", ""),
             })
         checks_with_explain = []
         for c in results["checks"]:
