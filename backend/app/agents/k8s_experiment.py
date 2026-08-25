@@ -1094,6 +1094,7 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
         },
         "workloads": cleaned_workloads,
         "checks": cleaned_checks,
+        "_auto_labels": sorted(auto_generated_labels),
     }
 
 
@@ -1543,7 +1544,8 @@ async def run_experiment(
             # guarantee the LLM intended marker strings will appear in a
             # generic server's logs.  Skip immediately instead of burning
             # the full timeout for nothing.
-            if c.get("type") == "pod_log_match" and _target_ref in auto_generated_labels and not c.get("_skipped"):
+            _auto_labels = set(plan.get("_auto_labels") or [])
+            if c.get("type") == "pod_log_match" and _target_ref in _auto_labels and not c.get("_skipped"):
                 c["_skipped"] = True
                 c["evidence"] = (f"目标工作负载 {_target_ref} 由系统自动补齐（通用服务器），"
                                  f"无法保证输出期望标记 '{c.get('expect','')[:40]}'，断言跳过")
