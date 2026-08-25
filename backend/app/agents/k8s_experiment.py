@@ -97,6 +97,20 @@ def _validate_and_fix_workload_yaml(w: dict) -> dict:
                     args = _re.sub(r'\$\(\(\$RANDOM\+(\d+)\)\)', r'\1', args)
 
                 # Generate a clean YAML
+                container = {
+                    "name": name,
+                    "image": image,
+                    "resources": {"requests": {"cpu": "50m", "memory": "64Mi"},
+                                  "limits": {"cpu": "200m", "memory": "256Mi"}},
+                }
+                # For database images whose entrypoint handles first-boot
+                # initialization (mysql/postgres), do NOT override command
+                # with sh -c — pass args through so the entrypoint init runs.
+                if "mysql" in image.lower() and "mysqld" in cmd:
+                    container["args"] = [t for t in (cmd + " " + args).split() if t]
+                else:
+                    container["command"] = ["/bin/sh", "-c"]
+                    container["args"] = [args]
                 clean_yaml = {
                     "apiVersion": "apps/v1",
                     "kind": "Deployment",
@@ -107,14 +121,7 @@ def _validate_and_fix_workload_yaml(w: dict) -> dict:
                         "template": {
                             "metadata": {"labels": {"app": name}},
                             "spec": {
-                                "containers": [{
-                                    "name": name,
-                                    "image": image,
-                                    "command": ["/bin/sh", "-c"],
-                                    "args": [args],
-                                    "resources": {"requests": {"cpu": "50m", "memory": "64Mi"},
-                                                  "limits": {"cpu": "200m", "memory": "256Mi"}},
-                                }]
+                                "containers": [container]
                             }
                         }
                     }
@@ -158,23 +165,25 @@ def _validate_and_fix_workload_yaml(w: dict) -> dict:
                             cmd = cmd.replace("$(($RANDOM+3))", "3")
                             c["args"] = [cmd]
                             logger.info("workload %s: fixed MySQL $(()) syntax", w.get("name"))
-                        # Fix -pPassword → -p Password (space missing)
-                        # Only match -p at start of string or after space, NOT in --flags
-                        # This avoids breaking --default-authentication-plugin etc.
+                        # NOTE: do NOT insert a space into `-p<password>`!
+                        # MySQL clients require the password ATTACHED to -p
+                        # (`-pairwtest123`). The spaced form `-p airwtest123`
+                        # makes -p an interactive prompt flag and treats the
+                        # password as a database name → auth always fails.
+                        # Only guard against shell arithmetic that breaks sh.
                         import re as _re_fix
-                        cmd_before = cmd
-                        # Match -p followed by letter, preceded by space/start, not followed by =
-                        cmd = _re_fix.sub(r'(?:^|\s)-p([a-zA-Z]\w+)(?!=)', lambda m: m.group(0).replace('-p' + m.group(1), '-p ' + m.group(1)), cmd)
-                        if cmd != cmd_before:
+                        if "$((" in cmd:
+                            cmd = _re_fix.sub(r'\$\(\(\$RANDOM\+(\d+)\)\)', r'\1', cmd)
                             c["args"] = [cmd]
-                            logger.info("workload %s: fixed MySQL -p syntax", w.get("name"))
 
                 # Ensure readinessProbe for long-running containers
                 if "readinessProbe" not in c:
                     probe = None
                     if "mysql" in image.lower():
-                        probe = {"exec": {"command": ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p", "airwtest123"]},
-                                 "initialDelaySeconds": 90, "periodSeconds": 10}
+                        # --password=xxx form is unambiguous in argv arrays;
+                        # split "-p airwtest123" would prompt interactively.
+                        probe = {"exec": {"command": ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "--password=airwtest123"]},
+                                 "initialDelaySeconds": 30, "periodSeconds": 10}
                     elif "redis" in image.lower():
                         probe = {"exec": {"command": ["redis-cli", "ping"]},
                                  "initialDelaySeconds": 10, "periodSeconds": 5}
@@ -284,13 +293,28 @@ def _make_mysql_workload(name: str, app_label: str, namespace: str, image: str) 
                             {"name": "MYSQL_ROOT_PASSWORD", "value": "airwtest123"},
                             {"name": "MYSQL_DATABASE", "value": "testdb"},
                         ],
-                        "command": ["/bin/sh", "-c"],
-                        "args": ["mysqld --server-id=1 --log-bin=mysql-bin --binlog_format=ROW --gtid_mode=ON --enforce-gtid-consistency=ON --read_only=OFF --default-authentication-plugin=mysql_native_password"],
-                        "resources": {"requests": {"cpu": "200m", "memory": "256Mi"},
-                                       "limits": {"cpu": "500m", "memory": "512Mi"}},
+                        # IMPORTANT: do NOT override the container command.
+                        # The official mysql image's ENTRYPOINT
+                        # (docker-entrypoint.sh) performs first-boot data-dir
+                        # initialization. Overriding it with sh -c 'mysqld …'
+                        # skips that step and mysqld aborts instantly with
+                        # "Failed to find valid data directory" → CrashLoopBackOff.
+                        # Instead pass flags via args; the entrypoint detects the
+                        # leading "mysqld" token and runs its init flow first.
+                        "args": [
+                            "mysqld",
+                            "--server-id=1",
+                            "--log-bin=mysql-bin",
+                            "--binlog_format=ROW",
+                            "--gtid_mode=ON",
+                            "--enforce-gtid-consistency=ON",
+                            "--read_only=OFF",
+                        ],
+                        "resources": {"requests": {"cpu": "200m", "memory": "512Mi"},
+                                       "limits": {"cpu": "1000m", "memory": "1Gi"}},
                         "readinessProbe": {
-                            "exec": {"command": ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p", "airwtest123"]},
-                            "initialDelaySeconds": 60, "periodSeconds": 10, "timeoutSeconds": 5,
+                            "exec": {"command": ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "--password=airwtest123"]},
+                            "initialDelaySeconds": 30, "periodSeconds": 10, "timeoutSeconds": 5,
                         },
                     }],
                 },
@@ -728,12 +752,16 @@ async def _ask_hermes_for_experiment(
         "2. 镜像用 registry.adms.io:31542/library/<image>:<tag>。\n"
         "3. Deployment 不写 restartPolicy；labels 用 app=<名>。\n"
         "4. 压测/验证 Pod 命令先 until 等待依赖就绪再执行，输出可解析结果。\n"
-        "5. mysql 容器需设置 MYSQL_ROOT_PASSWORD=yes 或 MYSQL_ALLOW_EMPTY_PASSWORD=yes。\n"
-        "6. 资源请求 cpu<=500m, memory<=512Mi。\n"
+        "5. mysql 容器需设置 MYSQL_ROOT_PASSWORD=airwtest123（不要用 yes/空密码）。\n"
+        "6. 资源请求 cpu<=500m, memory<=512Mi；mysql 建议内存 limit>=1Gi。\n"
         "7. checks 必须与 workloads 一一对应，不要引用未部署的资源。\n"
         "8. 优先用 pod_log_match 进行功能验证（匹配 Pod 输出中的关键结果），pod_ready 仅作辅助。\n"
         "9. MySQL 启动命令中不要使用 $(()) shell 语法，直接用固定数字（如 --server-id=1）。\n"
-        "10. mysqladmin 命令的 -p 参数和密码之间必须有空格（如 -p airwtest123，不是 -pairwtest123）。\n\n"
+        "10. mysql 客户端密码必须紧跟 -p（如 -pairwtest123）或用 --password=airwtest123。"
+        "绝对不要写成 -p airwtest123（分开会被当作交互式输入提示，认证必然失败）！\n"
+        "11. mysql 镜像的容器不要覆盖 command（不要用 /bin/sh -c 'mysqld ...'），"
+        "镜像自带的 docker-entrypoint.sh 负责首次数据目录初始化，覆盖后 mysqld 会因找不到数据目录立即崩溃。"
+        "启动参数放在 args 列表中（第一个元素是 mysqld）。校验脚本类任务可以用 /bin/sh -c 执行 mysql 客户端命令并 echo 结果标记。\n\n"
         "JSON格式：\n"
         "{\"experiment\":{\"name\":\"x\",\"namespace\":\"" + namespace + "\"},"
         "\"workloads\":[{\"name\":\"x\",\"kind\":\"Deployment\",\"image\":\"registry.adms.io:31542/library/redis:7.0.4\",\"replicas\":1,\"yaml\":\"...\"}],"
