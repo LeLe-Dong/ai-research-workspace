@@ -570,7 +570,7 @@ def _make_mysql_verify_workload(name: str, app_label: str, namespace: str,
             "template": {
                 "metadata": {"labels": {"app": app_label}},
                 "spec": {
-                    "restartPolicy": "Never",
+                    "restartPolicy": "Always",
                     "containers": [{
                         "name": "validator",
                         "image": "registry.adms.io:31542/library/mysql:8.0.32",
@@ -1236,8 +1236,10 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
         # Expand template: generate workload if not already done for this tpl
         if tpl_key not in verify_workloads_added:
             tpl = VERIFY_TEMPLATES[tpl_key]
-            wl_name = f"verify-{tpl_key}"
-            app_label = f"verify-{tpl_key}"
+            # K8s names must be RFC 1123: lowercase alphanum + hyphens only
+            safe_key = tpl_key.replace("_", "-")
+            wl_name = f"verify-{safe_key}"
+            app_label = f"verify-{safe_key}"
             wl_yaml = _make_workload_from_template(
                 tpl_key, wl_name, app_label, namespace,
                 master=master_svc, slave=slave_svc,
