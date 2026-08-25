@@ -1007,6 +1007,7 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
             check_targets.add(ref)
 
     auto_generated: list[dict] = []
+    auto_generated_labels: set[str] = set()  # labels of workloads we auto-create
     for label in check_targets:
         # Skip if already deployed (by workload name or app label)
         if label in deployed_names or label in deployed_apps:
@@ -1026,6 +1027,7 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
             "yaml": wl_yaml,
             "_auto": True,
         })
+        auto_generated_labels.add(label.lower())
         logger.info("auto-generated workload %r for check target %r (image: %s)", wl_name, label, auto_image)
         # Update deployed sets so later checks can match
         deployed_names.add(wl_name)
@@ -1531,6 +1533,20 @@ async def run_experiment(
                 ) and not c.get("_skipped"):
                 c["_skipped"] = True
                 c["evidence"] = f"目标工作负载 {c['target']} 应用失败，断言跳过"
+                yield AgentEvent(phase="validate", level="warn",
+                                 title=f"断言跳过: {c['name']}",
+                                 detail=c["evidence"], task_id="task-10",
+                                 task_progress=min(80, 45 + ci * 3))
+                continue
+
+            # pod_log_match checks on auto-generated workloads: we cannot
+            # guarantee the LLM intended marker strings will appear in a
+            # generic server's logs.  Skip immediately instead of burning
+            # the full timeout for nothing.
+            if c.get("type") == "pod_log_match" and _target_ref in auto_generated_labels and not c.get("_skipped"):
+                c["_skipped"] = True
+                c["evidence"] = (f"目标工作负载 {_target_ref} 由系统自动补齐（通用服务器），"
+                                 f"无法保证输出期望标记 '{c.get('expect','')[:40]}'，断言跳过")
                 yield AgentEvent(phase="validate", level="warn",
                                  title=f"断言跳过: {c['name']}",
                                  detail=c["evidence"], task_id="task-10",
