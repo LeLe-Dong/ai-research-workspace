@@ -174,7 +174,7 @@ def _validate_and_fix_workload_yaml(w: dict) -> dict:
                     probe = None
                     if "mysql" in image.lower():
                         probe = {"exec": {"command": ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p", "airwtest123"]},
-                                 "initialDelaySeconds": 60, "periodSeconds": 10}
+                                 "initialDelaySeconds": 90, "periodSeconds": 10}
                     elif "redis" in image.lower():
                         probe = {"exec": {"command": ["redis-cli", "ping"]},
                                  "initialDelaySeconds": 10, "periodSeconds": 5}
@@ -988,7 +988,8 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
         timeout = max(10, int(c.get("timeout_sec") or 90))
         # Cap each check's wait so many checks can't pile up hundreds of
         # seconds of serial timeouts (this was timing out whole researches).
-        timeout = min(timeout, 120)
+        # MySQL initialization can take 60-90s, so allow up to 180s per check.
+        timeout = min(timeout, 180)
         if not exists:
             logger.warning(
                 "skipping check %r: target %r has no matching workload "
@@ -1230,10 +1231,11 @@ async def _check_pod_log_match(kc_path: str, ns: str, target: str, substring: st
                 if container_error != "CrashLoopBackOff":
                     container_error = "CrashLoopBackOff"
                     crash_start_ts = asyncio.get_event_loop().time()
-                # Fast-fail: if CrashLoopBackOff persists for 30s, don't wait full timeout
-                elif asyncio.get_event_loop().time() - crash_start_ts > 30:
+                # Fast-fail: if CrashLoopBackOff persists for 60s, don't wait full timeout
+                # MySQL initialization can take 60-90s, so be more patient
+                elif asyncio.get_event_loop().time() - crash_start_ts > 60:
                     return {"passed": False,
-                            "evidence": f"Pod 持续 CrashLoopBackOff 超过 30s，快速失败; 状态: {st_out[:200]}"}
+                            "evidence": f"Pod 持续 CrashLoopBackOff 超过 60s，快速失败; 状态: {st_out[:200]}"}
             elif "waiting" in st_out and "Error" in st_out:
                 container_error = "Error"
             elif "terminated" in st_out:
