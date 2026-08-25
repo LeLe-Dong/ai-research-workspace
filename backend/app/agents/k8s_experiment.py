@@ -142,6 +142,40 @@ def _validate_and_fix_workload_yaml(w: dict) -> dict:
         kind = doc.get("kind", "")
         spec = doc.get("spec", {})
 
+        # Fix labels/selectors emitted as a list of {name,value} maps —
+        # K8s requires map[string]string. LLM occasionally produces:
+        #   labels: [{name: app, value: x}]
+        def _fix_label_map(obj, path):
+            if not isinstance(obj, dict):
+                return
+            v = obj.get(path)
+            if isinstance(v, list):
+                fixed = {}
+                for item in v:
+                    if isinstance(item, dict) and "name" in item:
+                        fixed[str(item["name"])] = str(item.get("value", ""))
+                    elif isinstance(item, str) and "=" in item:
+                        k, _, val = item.partition("=")
+                        fixed[k] = val
+                if fixed:
+                    obj[path] = fixed
+                    logger.info("workload %s: converted %s list to map", w.get("name"), path)
+        _fix_label_map(doc.get("metadata", {}) if isinstance(doc.get("metadata"), dict) else {}, "labels")
+        if isinstance(spec, dict):
+            sel = spec.get("selector")
+            if isinstance(sel, dict):
+                _fix_label_map(sel, "matchLabels")
+                # selector.matchLabels must equal template labels; sync it
+                tmpl_meta = (spec.get("template") or {}).get("metadata") or {}
+                if isinstance(tmpl_meta, dict) and isinstance(tmpl_meta.get("labels"), dict) \
+                        and isinstance(sel.get("matchLabels"), dict) and not sel.get("matchLabels"):
+                    sel["matchLabels"] = dict(tmpl_meta["labels"])
+            tmpl = spec.get("template")
+            if isinstance(tmpl, dict):
+                tm = tmpl.get("metadata")
+                if isinstance(tm, dict):
+                    _fix_label_map(tm, "labels")
+
         if kind == "Deployment":
             template = spec.get("template", {}).get("spec", {})
             containers = template.get("containers", [])
@@ -929,19 +963,29 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
     # have no matching manifest) — those would burn the full timeout then
     # fail. We surface them as skipped instead.
     deployed_names = {str(w["name"]).lower() for w in cleaned_workloads}
-    # Also collect the app=<x> label that each workload's pod carries, if any.
+    # Also collect the app=<x> label each workload's pod carries. Parse the
+    # ACTUAL yaml (metadata.name, selector.matchLabels AND pod template
+    # labels) — LLM plans often have w["name"] inconsistent with the YAML.
     deployed_apps: set[str] = set()
     for w in cleaned_workloads:
         try:
-            doc = yaml.safe_load(w["yaml"])
-            if isinstance(doc, dict):
-                md = doc.get("metadata") or {}
-                lbl = ((doc.get("spec") or {}).get("selector") or {}).get("matchLabels") or {}
-                for k, v in lbl.items():
-                    if k == "app":
-                        deployed_apps.add(str(v).lower())
+            docs_w = [d for d in yaml.safe_load_all(w["yaml"]) if isinstance(d, dict)]
         except Exception:
-            pass
+            continue
+        for doc in docs_w:
+            md = doc.get("metadata") or {}
+            if isinstance(md, dict) and md.get("name"):
+                deployed_names.add(str(md["name"]).lower())
+            lbl = {}
+            sel = ((doc.get("spec") or {}).get("selector") or {})
+            if isinstance(sel, dict):
+                lbl.update(sel.get("matchLabels") or {})
+            tmpl_lbl = (((doc.get("spec") or {}).get("template") or {}).get("metadata") or {}).get("labels") or {}
+            if isinstance(tmpl_lbl, dict):
+                lbl.update(tmpl_lbl)
+            for k, v in lbl.items():
+                if k == "app":
+                    deployed_apps.add(str(v).lower())
 
     # ──────────────────────────────────────────────────────────────────
     # Auto-generate workloads for checks that reference non-deployed
@@ -1433,7 +1477,24 @@ async def run_experiment(
                                      detail=cmd_txt[:600],
                                      task_id="task-10")
             else:
-                _failed_workloads.add(w["name"])
+                _failed_workloads.add(w["name"].lower())
+                # Also store app label from YAML so check targets like
+                # app=X can be matched against failed workloads.
+                try:
+                    _fd_doc = yaml.safe_load(w["yaml"])
+                    if isinstance(_fd_doc, dict):
+                        _fd_sel = ((_fd_doc.get("spec") or {}).get("selector") or {})
+                        _fd_lbls = {}
+                        if isinstance(_fd_sel, dict):
+                            _fd_lbls.update(_fd_sel.get("matchLabels") or {})
+                        _fd_tlbl = (((_fd_doc.get("spec") or {}).get("template") or {}).get("metadata") or {}).get("labels") or {}
+                        if isinstance(_fd_tlbl, dict):
+                            _fd_lbls.update(_fd_tlbl)
+                        for _fd_k, _fd_v in _fd_lbls.items():
+                            if _fd_k == "app":
+                                _failed_workloads.add(str(_fd_v).lower())
+                except Exception:
+                    pass
                 # Get detailed error info from kubectl describe
                 describe_detail = ""
                 try:
@@ -1459,7 +1520,15 @@ async def run_experiment(
         for ci, c in enumerate(plan["checks"]):
             # Auto-skip checks whose target workload failed to apply —
             # avoids hanging on pod_log_match for non-existent pods.
-            if c["target"] in _failed_workloads and not c.get("_skipped"):
+            # Normalize: strip "app=" prefix and kind/ prefix to get the
+            # bare label/name for comparison with _failed_workloads.
+            _target_ref = c["target"].split("/")[-1].lower().strip()
+            if _target_ref.startswith("app="):
+                _target_ref = _target_ref[4:]
+            _target_ref = _target_ref.strip()
+            if (_target_ref in _failed_workloads
+                or (_target_ref and any(_target_ref in fw for fw in _failed_workloads))
+                ) and not c.get("_skipped"):
                 c["_skipped"] = True
                 c["evidence"] = f"目标工作负载 {c['target']} 应用失败，断言跳过"
                 yield AgentEvent(phase="validate", level="warn",
