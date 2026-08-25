@@ -598,18 +598,23 @@ VERIFY_TEMPLATES: dict[str, dict] = {
         "desc": "连接从库执行 SHOW SLAVE STATUS，输出 IO/SQL 线程运行状态",
         "image_type": "mysql",
         "script": (
-            "echo 'CHECKING REPLICATION STATUS';"
+            "echo 'WAITING FOR SLAVE TO BE READY...';"
+            " for i in $(seq 1 30); do"
+            "   if mysql -h $SLAVE_HOST -u root -e 'SELECT 1' >/dev/null 2>&1; then break; fi;"
+            "   sleep 2;"
+            " done;"
+            " echo 'CHECKING REPLICATION STATUS';"
             " IO=$(mysql -h $SLAVE_HOST -u root -e \"SHOW SLAVE STATUS\\G\" 2>/dev/null | grep Slave_IO_Running | awk '{print $2}');"
             " SQL=$(mysql -h $SLAVE_HOST -u root -e \"SHOW SLAVE STATUS\\G\" 2>/dev/null | grep Slave_SQL_Running | awk '{print $2}');"
             " DELAY=$(mysql -h $SLAVE_HOST -u root -e \"SHOW SLAVE STATUS\\G\" 2>/dev/null | grep Seconds_Behind_Master | awk '{print $2}');"
-            " echo IO_THREAD_OK=$IO;"
-            " echo SQL_THREAD_OK=$SQL;"
-            " echo REPLICATION_DELAY=$DELAY;"
+            " echo IO_THREAD_OK=${IO:-NOT_FOUND};"
+            " echo SQL_THREAD_OK=${SQL:-NOT_FOUND};"
+            " echo REPLICATION_DELAY=${DELAY:-NOT_FOUND};"
             " echo REPLICATION_CHECK_DONE;"
         ),
         "checks": [
-            {"type": "pod_log_match", "expect": "IO_THREAD_OK=Yes", "timeout_sec": 120},
-            {"type": "pod_log_match", "expect": "SQL_THREAD_OK=Yes", "timeout_sec": 120},
+            {"type": "pod_log_match", "expect": "IO_THREAD_OK=Yes", "timeout_sec": 180},
+            {"type": "pod_log_match", "expect": "SQL_THREAD_OK=Yes", "timeout_sec": 180},
         ],
     },
 
@@ -619,17 +624,22 @@ VERIFY_TEMPLATES: dict[str, dict] = {
         "desc": "检查主从库 gtid_mode 和 enforce_gtid_consistency 是否为 ON",
         "image_type": "mysql",
         "script": (
-            "echo 'CHECKING GTID MODE';"
-            " M_Gtid=$(mysql -h $MASTER_HOST -u root -e \"SELECT @@global.gtid_mode;\" -sN 2>/dev/null);"
-            " M_Enf=$(mysql -h $MASTER_HOST -u root -e \"SELECT @@global.enforce_gtid_consistency;\" -sN 2>/dev/null);"
-            " S_Gtid=$(mysql -h $SLAVE_HOST -u root -e \"SELECT @@global.gtid_mode;\" -sN 2>/dev/null);"
-            " echo MASTER_GTID_MODE=$M_Gtid;"
-            " echo MASTER_GTID_ENFORCE=$M_Enf;"
-            " echo SLAVE_GTID_MODE=$S_Gtid;"
+            "echo 'WAITING FOR SERVICES...';"
+            " for i in $(seq 1 15); do"
+            "   if mysql -h $MASTER_HOST -u root -e 'SELECT 1' >/dev/null 2>&1; then break; fi;"
+            "   sleep 2;"
+            " done;"
+            " echo 'CHECKING GTID MODE';"
+            " M_Gtid=$(mysql -h $MASTER_HOST -u root -e \"SELECT @@global.gtid_mode;\" -sN 2>/dev/null || echo FAILED);"
+            " M_Enf=$(mysql -h $MASTER_HOST -u root -e \"SELECT @@global.enforce_gtid_consistency;\" -sN 2>/dev/null || echo FAILED);"
+            " S_Gtid=$(mysql -h $SLAVE_HOST -u root -e \"SELECT @@global.gtid_mode;\" -sN 2>/dev/null || echo FAILED);"
+            " echo MASTER_GTID_MODE=${M_Gtid};"
+            " echo MASTER_GTID_ENFORCE=${M_Enf};"
+            " echo SLAVE_GTID_MODE=${S_Gtid};"
             " if [ \"$M_Gtid\" = \"ON\" ] && [ \"$S_Gtid\" = \"ON\" ]; then echo GTID_VERIFIED=ON; else echo GTID_VERIFIED=OFF; fi;"
         ),
         "checks": [
-            {"type": "pod_log_match", "expect": "GTID_VERIFIED=ON", "timeout_sec": 60},
+            {"type": "pod_log_match", "expect": "GTID_VERIFIED=ON", "timeout_sec": 120},
         ],
     },
 
@@ -639,13 +649,18 @@ VERIFY_TEMPLATES: dict[str, dict] = {
         "desc": "检查主库 binlog_format 是否为 ROW",
         "image_type": "mysql",
         "script": (
-            "echo 'CHECKING BINLOG FORMAT';"
-            " FMT=$(mysql -h $MASTER_HOST -u root -e \"SELECT @@global.binlog_format;\" -sN 2>/dev/null);"
+            "echo 'WAITING FOR MASTER...';"
+            " for i in $(seq 1 15); do"
+            "   if mysql -h $MASTER_HOST -u root -e 'SELECT 1' >/dev/null 2>&1; then break; fi;"
+            "   sleep 2;"
+            " done;"
+            " echo 'CHECKING BINLOG FORMAT';"
+            " FMT=$(mysql -h $MASTER_HOST -u root -e \"SELECT @@global.binlog_format;\" -sN 2>/dev/null || echo FAILED);"
             " echo BINLOG_FORMAT=$FMT;"
             " if [ \"$FMT\" = \"ROW\" ]; then echo BINLOG_VERIFIED=ROW; else echo BINLOG_VERIFIED=$FMT; fi;"
         ),
         "checks": [
-            {"type": "pod_log_match", "expect": "BINLOG_VERIFIED=ROW", "timeout_sec": 60},
+            {"type": "pod_log_match", "expect": "BINLOG_VERIFIED=ROW", "timeout_sec": 120},
         ],
     },
 
@@ -655,15 +670,24 @@ VERIFY_TEMPLATES: dict[str, dict] = {
         "desc": "检查从库 read_only=1，主库 read_only=0",
         "image_type": "mysql",
         "script": (
-            "echo 'CHECKING READ ONLY';"
-            " M_RO=$(mysql -h $MASTER_HOST -u root -e \"SELECT @@global.read_only;\" -sN 2>/dev/null);"
-            " S_RO=$(mysql -h $SLAVE_HOST -u root -e \"SELECT @@global.read_only;\" -sN 2>/dev/null);"
+            "echo 'WAITING FOR SERVICES...';"
+            " for i in $(seq 1 15); do"
+            "   if mysql -h $MASTER_HOST -u root -e 'SELECT 1' >/dev/null 2>&1; then break; fi;"
+            "   sleep 2;"
+            " done;"
+            " for i in $(seq 1 15); do"
+            "   if mysql -h $SLAVE_HOST -u root -e 'SELECT 1' >/dev/null 2>&1; then break; fi;"
+            "   sleep 2;"
+            " done;"
+            " echo 'CHECKING READ ONLY';"
+            " M_RO=$(mysql -h $MASTER_HOST -u root -e \"SELECT @@global.read_only;\" -sN 2>/dev/null || echo FAILED);"
+            " S_RO=$(mysql -h $SLAVE_HOST -u root -e \"SELECT @@global.read_only;\" -sN 2>/dev/null || echo FAILED);"
             " echo MASTER_READ_ONLY=$M_RO;"
             " echo SLAVE_READ_ONLY=$S_RO;"
             " if [ \"$M_RO\" = \"0\" ] && [ \"$S_RO\" = \"1\" ]; then echo READ_ONLY_VERIFIED=OK; else echo READ_ONLY_VERIFIED=FAIL; fi;"
         ),
         "checks": [
-            {"type": "pod_log_match", "expect": "READ_ONLY_VERIFIED=OK", "timeout_sec": 60},
+            {"type": "pod_log_match", "expect": "READ_ONLY_VERIFIED=OK", "timeout_sec": 120},
         ],
     },
 
@@ -673,7 +697,12 @@ VERIFY_TEMPLATES: dict[str, dict] = {
         "desc": "主库写入 10 条数据，等待复制完成，从库查询验证行数一致",
         "image_type": "mysql",
         "script": (
-            "echo 'WRITING TO MASTER';"
+            "echo 'WAITING FOR MASTER...';"
+            " for i in $(seq 1 30); do"
+            "   if mysql -h $MASTER_HOST -u root -e 'SELECT 1' >/dev/null 2>&1; then break; fi;"
+            "   sleep 2;"
+            " done;"
+            " echo 'WRITING TO MASTER';"
             " mysql -h $MASTER_HOST -u root -e \""
             " CREATE DATABASE IF NOT EXISTS repl_test;"
             " USE repl_test;"
@@ -681,11 +710,11 @@ VERIFY_TEMPLATES: dict[str, dict] = {
             " CREATE TABLE verify_data (id INT AUTO_INCREMENT PRIMARY KEY, payload VARCHAR(50));"
             " INSERT INTO verify_data (payload) VALUES ('row-1'),('row-2'),('row-3'),('row-4'),('row-5'),"
             " ('row-6'),('row-7'),('row-8'),('row-9'),('row-10');"
-            " SELECT COUNT(*) AS MASTER_COUNT FROM verify_data;"
-            "\" 2>/dev/null | tail -1 | awk '{print \"MASTER_ROW_COUNT=\" $1}';"
+            "\" 2>/dev/null;"
+            " MC=$(mysql -h $MASTER_HOST -u root -N -e \"SELECT COUNT(*) FROM repl_test.verify_data;\" 2>/dev/null);"
+            " echo MASTER_ROW_COUNT=${MC:-0};"
             " echo 'WAITING FOR REPLICATION...';"
-            " sleep 5;"
-            " for i in 1 2 3 4 5 6 7 8 9 10; do"
+            " for i in $(seq 1 30); do"
             "   CNT=$(mysql -h $SLAVE_HOST -u root -N -e \"SELECT COUNT(*) FROM repl_test.verify_data;\" 2>/dev/null);"
             "   if [ \"$CNT\" = \"10\" ]; then"
             "     echo SLAVE_ROW_COUNT=$CNT;"
@@ -700,9 +729,9 @@ VERIFY_TEMPLATES: dict[str, dict] = {
             " echo REPLICATION_VERIFIED=false;"
         ),
         "checks": [
-            {"type": "pod_log_match", "expect": "MASTER_ROW_COUNT=10", "timeout_sec": 30},
-            {"type": "pod_log_match", "expect": "ROW_COUNT_MATCH=true", "timeout_sec": 120},
-            {"type": "pod_log_match", "expect": "REPLICATION_VERIFIED=true", "timeout_sec": 120},
+            {"type": "pod_log_match", "expect": "MASTER_ROW_COUNT=10", "timeout_sec": 60},
+            {"type": "pod_log_match", "expect": "ROW_COUNT_MATCH=true", "timeout_sec": 180},
+            {"type": "pod_log_match", "expect": "REPLICATION_VERIFIED=true", "timeout_sec": 180},
         ],
     },
 
@@ -712,7 +741,12 @@ VERIFY_TEMPLATES: dict[str, dict] = {
         "desc": "使用 mysqlslap 运行简单查询基准，输出 QPS",
         "image_type": "mysql",
         "script": (
-            "echo 'RUNNING BENCHMARK';"
+            "echo 'WAITING FOR MASTER...';"
+            " for i in $(seq 1 15); do"
+            "   if mysql -h $MASTER_HOST -u root -e 'SELECT 1' >/dev/null 2>&1; then break; fi;"
+            "   sleep 2;"
+            " done;"
+            " echo 'RUNNING BENCHMARK';"
             " mysqlslap -h $MASTER_HOST -u root --auto-generate-sql-write-number=1000"
             " --auto-generate-sql=auto-generate-sql-write-type=INSERT"
             " --auto-generate-sql-load-type=key"
