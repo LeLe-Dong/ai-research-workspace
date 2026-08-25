@@ -543,6 +543,212 @@ def _make_busybox_workload(name: str, app_label: str, namespace: str, image: str
     return yaml.safe_dump(dep)
 
 
+# ──────────────────────────────────────────────────────────────────
+# Verification Templates
+# ──────────────────────────────────────────────────────────────────
+# Each template defines a workload generator + check expectation for a
+# common verification pattern.  LLM plans reference templates by key
+# in check targets (e.g. "target: verify:mysql_check_replication"),
+# and _validate_plan auto-generates the corresponding Deployment + check.
+# This bridges the gap between "what to verify" (LLM's strength) and
+# "how to execute it" (system's strength).
+
+def _make_mysql_verify_workload(name: str, app_label: str, namespace: str,
+                                script: str, master: str = "mysql-master",
+                                slave: str = "mysql-slave",
+                                memory: str = "256Mi") -> str:
+    """Generate a MySQL-client verification Deployment that runs a script
+    connecting to master/slave services and echoing result markers."""
+    import shlex
+    dep = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": name, "namespace": namespace, "labels": {"app": app_label}},
+        "spec": {
+            "replicas": 1,
+            "selector": {"matchLabels": {"app": app_label}},
+            "template": {
+                "metadata": {"labels": {"app": app_label}},
+                "spec": {
+                    "restartPolicy": "Never",
+                    "containers": [{
+                        "name": "validator",
+                        "image": "registry.adms.io:31542/library/mysql:8.0.32",
+                        "command": ["/bin/sh", "-c"],
+                        "args": [script],
+                        "env": [
+                            {"name": "MYSQL_PWD", "value": "airwtest123"},
+                            {"name": "MASTER_HOST", "value": master},
+                            {"name": "SLAVE_HOST", "value": slave},
+                        ],
+                        "resources": {"requests": {"cpu": "100m", "memory": memory},
+                                       "limits": {"cpu": "500m", "memory": "512Mi"}},
+                    }],
+                },
+            },
+        },
+    }
+    return yaml.safe_dump(dep)
+
+
+VERIFY_TEMPLATES: dict[str, dict] = {
+    # ─── MySQL 复制状态检查 ─────────────────────────────────────
+    "mysql_check_replication": {
+        "name": "MySQL 复制状态检查",
+        "desc": "连接从库执行 SHOW SLAVE STATUS，输出 IO/SQL 线程运行状态",
+        "image_type": "mysql",
+        "script": (
+            "echo 'CHECKING REPLICATION STATUS';"
+            " IO=$(mysql -h $SLAVE_HOST -u root -e \"SHOW SLAVE STATUS\\G\" 2>/dev/null | grep Slave_IO_Running | awk '{print $2}');"
+            " SQL=$(mysql -h $SLAVE_HOST -u root -e \"SHOW SLAVE STATUS\\G\" 2>/dev/null | grep Slave_SQL_Running | awk '{print $2}');"
+            " DELAY=$(mysql -h $SLAVE_HOST -u root -e \"SHOW SLAVE STATUS\\G\" 2>/dev/null | grep Seconds_Behind_Master | awk '{print $2}');"
+            " echo IO_THREAD_OK=$IO;"
+            " echo SQL_THREAD_OK=$SQL;"
+            " echo REPLICATION_DELAY=$DELAY;"
+            " echo REPLICATION_CHECK_DONE;"
+        ),
+        "checks": [
+            {"type": "pod_log_match", "expect": "IO_THREAD_OK=Yes", "timeout_sec": 120},
+            {"type": "pod_log_match", "expect": "SQL_THREAD_OK=Yes", "timeout_sec": 120},
+        ],
+    },
+
+    # ─── MySQL GTID 模式检查 ───────────────────────────────────
+    "mysql_check_gtid": {
+        "name": "MySQL GTID 模式检查",
+        "desc": "检查主从库 gtid_mode 和 enforce_gtid_consistency 是否为 ON",
+        "image_type": "mysql",
+        "script": (
+            "echo 'CHECKING GTID MODE';"
+            " M_Gtid=$(mysql -h $MASTER_HOST -u root -e \"SELECT @@global.gtid_mode;\" -sN 2>/dev/null);"
+            " M_Enf=$(mysql -h $MASTER_HOST -u root -e \"SELECT @@global.enforce_gtid_consistency;\" -sN 2>/dev/null);"
+            " S_Gtid=$(mysql -h $SLAVE_HOST -u root -e \"SELECT @@global.gtid_mode;\" -sN 2>/dev/null);"
+            " echo MASTER_GTID_MODE=$M_Gtid;"
+            " echo MASTER_GTID_ENFORCE=$M_Enf;"
+            " echo SLAVE_GTID_MODE=$S_Gtid;"
+            " if [ \"$M_Gtid\" = \"ON\" ] && [ \"$S_Gtid\" = \"ON\" ]; then echo GTID_VERIFIED=ON; else echo GTID_VERIFIED=OFF; fi;"
+        ),
+        "checks": [
+            {"type": "pod_log_match", "expect": "GTID_VERIFIED=ON", "timeout_sec": 60},
+        ],
+    },
+
+    # ─── MySQL Binlog 格式检查 ─────────────────────────────────
+    "mysql_check_binlog": {
+        "name": "MySQL Binlog 格式检查",
+        "desc": "检查主库 binlog_format 是否为 ROW",
+        "image_type": "mysql",
+        "script": (
+            "echo 'CHECKING BINLOG FORMAT';"
+            " FMT=$(mysql -h $MASTER_HOST -u root -e \"SELECT @@global.binlog_format;\" -sN 2>/dev/null);"
+            " echo BINLOG_FORMAT=$FMT;"
+            " if [ \"$FMT\" = \"ROW\" ]; then echo BINLOG_VERIFIED=ROW; else echo BINLOG_VERIFIED=$FMT; fi;"
+        ),
+        "checks": [
+            {"type": "pod_log_match", "expect": "BINLOG_VERIFIED=ROW", "timeout_sec": 60},
+        ],
+    },
+
+    # ─── MySQL Read Only 检查 ──────────────────────────────────
+    "mysql_check_read_only": {
+        "name": "MySQL 从库只读检查",
+        "desc": "检查从库 read_only=1，主库 read_only=0",
+        "image_type": "mysql",
+        "script": (
+            "echo 'CHECKING READ ONLY';"
+            " M_RO=$(mysql -h $MASTER_HOST -u root -e \"SELECT @@global.read_only;\" -sN 2>/dev/null);"
+            " S_RO=$(mysql -h $SLAVE_HOST -u root -e \"SELECT @@global.read_only;\" -sN 2>/dev/null);"
+            " echo MASTER_READ_ONLY=$M_RO;"
+            " echo SLAVE_READ_ONLY=$S_RO;"
+            " if [ \"$M_RO\" = \"0\" ] && [ \"$S_RO\" = \"1\" ]; then echo READ_ONLY_VERIFIED=OK; else echo READ_ONLY_VERIFIED=FAIL; fi;"
+        ),
+        "checks": [
+            {"type": "pod_log_match", "expect": "READ_ONLY_VERIFIED=OK", "timeout_sec": 60},
+        ],
+    },
+
+    # ─── MySQL 数据一致性检查 ──────────────────────────────────
+    "mysql_write_verify": {
+        "name": "MySQL 主写从读一致性检查",
+        "desc": "主库写入 10 条数据，等待复制完成，从库查询验证行数一致",
+        "image_type": "mysql",
+        "script": (
+            "echo 'WRITING TO MASTER';"
+            " mysql -h $MASTER_HOST -u root -e \""
+            " CREATE DATABASE IF NOT EXISTS repl_test;"
+            " USE repl_test;"
+            " DROP TABLE IF EXISTS verify_data;"
+            " CREATE TABLE verify_data (id INT AUTO_INCREMENT PRIMARY KEY, payload VARCHAR(50));"
+            " INSERT INTO verify_data (payload) VALUES ('row-1'),('row-2'),('row-3'),('row-4'),('row-5'),"
+            " ('row-6'),('row-7'),('row-8'),('row-9'),('row-10');"
+            " SELECT COUNT(*) AS MASTER_COUNT FROM verify_data;"
+            "\" 2>/dev/null | tail -1 | awk '{print \"MASTER_ROW_COUNT=\" $1}';"
+            " echo 'WAITING FOR REPLICATION...';"
+            " sleep 5;"
+            " for i in 1 2 3 4 5 6 7 8 9 10; do"
+            "   CNT=$(mysql -h $SLAVE_HOST -u root -N -e \"SELECT COUNT(*) FROM repl_test.verify_data;\" 2>/dev/null);"
+            "   if [ \"$CNT\" = \"10\" ]; then"
+            "     echo SLAVE_ROW_COUNT=$CNT;"
+            "     echo ROW_COUNT_MATCH=true;"
+            "     echo REPLICATION_VERIFIED=true;"
+            "     exit 0;"
+            "   fi;"
+            "   sleep 2;"
+            " done;"
+            " echo SLAVE_ROW_COUNT=${CNT:-0};"
+            " echo ROW_COUNT_MATCH=false;"
+            " echo REPLICATION_VERIFIED=false;"
+        ),
+        "checks": [
+            {"type": "pod_log_match", "expect": "MASTER_ROW_COUNT=10", "timeout_sec": 30},
+            {"type": "pod_log_match", "expect": "ROW_COUNT_MATCH=true", "timeout_sec": 120},
+            {"type": "pod_log_match", "expect": "REPLICATION_VERIFIED=true", "timeout_sec": 120},
+        ],
+    },
+
+    # ─── MySQL 基准压测 ────────────────────────────────────────
+    "mysql_bench": {
+        "name": "MySQL OLTP 基准压测",
+        "desc": "使用 mysqlslap 运行简单查询基准，输出 QPS",
+        "image_type": "mysql",
+        "script": (
+            "echo 'RUNNING BENCHMARK';"
+            " mysqlslap -h $MASTER_HOST -u root --auto-generate-sql-write-number=1000"
+            " --auto-generate-sql=auto-generate-sql-write-type=INSERT"
+            " --auto-generate-sql-load-type=key"
+            " --auto-generate-sql-unique-write-number=1000"
+            " --number-of-queries=2000 --iterations=1 2>&1 | tail -3;"
+            " echo BENCHMARK_DONE;"
+        ),
+        "checks": [
+            {"type": "pod_log_match", "expect": "BENCHMARK_DONE", "timeout_sec": 120},
+        ],
+    },
+}
+
+
+def _make_workload_from_template(tpl_key: str, name: str, app_label: str,
+                                 namespace: str, master: str, slave: str) -> str:
+    """Generate a verification workload YAML from a template key."""
+    tpl = VERIFY_TEMPLATES[tpl_key]
+    return _make_mysql_verify_workload(name, app_label, namespace,
+                                       script=tpl["script"],
+                                       master=master, slave=slave)
+
+
+def _is_verify_target(target: str) -> str | None:
+    """Check if a check target references a verify template.
+    Returns the template key if matched, else None.
+    E.g. 'verify:mysql_check_replication' → 'mysql_check_replication'
+    """
+    t = target.strip().lower()
+    if t.startswith("verify:"):
+        key = t[7:]
+        if key in VERIFY_TEMPLATES:
+            return key
+    return None
+
+
 def _mount_configmaps_if_present(plan: dict) -> None:
     """Auto-mount ConfigMaps that share a name prefix with Deployments.
 
@@ -796,6 +1002,18 @@ async def _ask_hermes_for_experiment(
         "11. mysql 镜像的容器不要覆盖 command（不要用 /bin/sh -c 'mysqld ...'），"
         "镜像自带的 docker-entrypoint.sh 负责首次数据目录初始化，覆盖后 mysqld 会因找不到数据目录立即崩溃。"
         "启动参数放在 args 列表中（第一个元素是 mysqld）。校验脚本类任务可以用 /bin/sh -c 执行 mysql 客户端命令并 echo 结果标记。\n\n"
+        "## 可用验证模板（推荐使用）\n"
+        "如果需要验证 MySQL 复制相关功能，请直接在 checks 中使用 verify: 模板，"
+        "系统会自动生成对应的校验器工作负载（Deployment + 脚本）。你只需写 check 的 target，"
+        "无需自己生成校验器 YAML。\n"
+        "可用模板：\n"
+        "  verify:mysql_check_replication  — 连从库检查 IO/SQL 线程状态\n"
+        "  verify:mysql_check_gtid          — 检查 GTID 模式是否 ON\n"
+        "  verify:mysql_check_binlog        — 检查 binlog_format=ROW\n"
+        "  verify:mysql_check_read_only     — 检查从库 read_only=1\n"
+        "  verify:mysql_write_verify        — 主库写入 10 条，从库验证一致\n"
+        "  verify:mysql_bench               — MySQL OLTP 基准压测\n"
+        "用法示例：{\"type\":\"pod_log_match\",\"target\":\"verify:mysql_write_verify\",\"expect\":\"REPLICATION_VERIFIED=true\"}\n\n"
         "JSON格式：\n"
         "{\"experiment\":{\"name\":\"x\",\"namespace\":\"" + namespace + "\"},"
         "\"workloads\":[{\"name\":\"x\",\"kind\":\"Deployment\",\"image\":\"registry.adms.io:31542/library/redis:7.0.4\",\"replicas\":1,\"yaml\":\"...\"}],"
@@ -986,6 +1204,68 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
             for k, v in lbl.items():
                 if k == "app":
                     deployed_apps.add(str(v).lower())
+
+    # ──────────────────────────────────────────────────────────────────
+    # Pre-pass: expand verify: template references into workloads + checks.
+    # When a check target is "verify:mysql_check_replication", auto-generate
+    # the corresponding verification Deployment and rewrite the check target
+    # to point at it.  This bridges "what to verify" (LLM's strength) with
+    # "how to execute it" (system's strength).
+    # ──────────────────────────────────────────────────────────────────
+    verify_workloads_added: dict[str, str] = {}  # tpl_key → app_label
+    master_svc = "mysql-master"
+    slave_svc = "mysql-slave"
+    # Detect actual master/slave service names from deployed workloads
+    for w in cleaned_workloads:
+        w_name = str(w.get("name", "")).lower()
+        if "master" in w_name:
+            master_svc = str(w.get("name", "mysql-master"))
+        if "slave" in w_name:
+            slave_svc = str(w.get("name", "mysql-slave"))
+
+    new_checks = []
+    for c in checks:
+        if not isinstance(c, dict):
+            new_checks.append(c)
+            continue
+        target = str(c.get("target", ""))[:200].strip()
+        tpl_key = _is_verify_target(target)
+        if not tpl_key:
+            new_checks.append(c)
+            continue
+        # Expand template: generate workload if not already done for this tpl
+        if tpl_key not in verify_workloads_added:
+            tpl = VERIFY_TEMPLATES[tpl_key]
+            wl_name = f"verify-{tpl_key}"
+            app_label = f"verify-{tpl_key}"
+            wl_yaml = _make_workload_from_template(
+                tpl_key, wl_name, app_label, namespace,
+                master=master_svc, slave=slave_svc,
+            )
+            cleaned_workloads.append({
+                "name": wl_name,
+                "kind": "Deployment",
+                "image": f"registry.adms.io:31542/library/mysql:8.0.32",
+                "replicas": 1,
+                "yaml": wl_yaml,
+                "_auto": True,
+                "_verify_template": True,
+            })
+            deployed_names.add(wl_name.lower())
+            deployed_apps.add(app_label.lower())
+            verify_workloads_added[tpl_key] = app_label
+            logger.info("generated verify workload %r from template %r", wl_name, tpl_key)
+        # Rewrite this check to target the generated workload
+        app_label = verify_workloads_added[tpl_key]
+        for tpl_check in tpl.get("checks", []):
+            new_checks.append({
+                "name": str(c.get("name", ""))[:80] or f"{tpl_key}-{tpl_check['type']}",
+                "type": tpl_check["type"],
+                "target": f"app={app_label}",
+                "expect": str(tpl_check.get("expect", c.get("expect", "")))[:200],
+                "timeout_sec": tpl_check.get("timeout_sec", 90),
+            })
+    checks = new_checks
 
     # ──────────────────────────────────────────────────────────────────
     # Auto-generate workloads for checks that reference non-deployed
