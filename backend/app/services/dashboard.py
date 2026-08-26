@@ -4,7 +4,7 @@ import random
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Research, Artifact, TimelineEvent
+from app.db.models import Research, Artifact, TimelineEvent, Review
 
 
 async def get_stats(session: AsyncSession) -> dict:
@@ -30,8 +30,11 @@ async def get_stats(session: AsyncSession) -> dict:
     running = rows.running or 0
     today_done = rows.today_done or 0
 
-    # Average score (mock fallback 8.4 if no reviews)
-    avg_score = 8.4
+    # Average score from actual reviews (fallback to 0.0 if no reviews yet)
+    avg_result = (await session.execute(
+        select(func.avg(Review.overall_score))
+    )).scalar()
+    avg_score = round(avg_result, 1) if avg_result else 0.0
 
     # KB count = number of completed researches (each has at least 1 markdown artifact)
     kb_count = completed
@@ -69,13 +72,17 @@ async def get_popular_knowledge(session: AsyncSession, limit: int = 4) -> list[d
     rows = res.all()
     items = []
     for r, a in rows:
+        # Fetch actual review score for this research
+        rv = (await session.execute(
+            select(Review.overall_score).where(Review.research_id == r.id)
+        )).scalar()
         items.append({
             "id": a.id,
             "research_id": r.id,
             "title": a.title,
             "excerpt": a.content.split("\n")[2][:140] if len(a.content.split("\n")) > 2 else "",
             "tags": [r.priority, r.depth],
-            "score": 8.4,
+            "score": round(rv, 1) if rv else None,
             "updated_at": r.updated_at,
         })
     return items
