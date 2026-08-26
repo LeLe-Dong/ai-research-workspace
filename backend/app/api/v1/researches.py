@@ -77,10 +77,22 @@ async def list_all(
         )
 
     rows = (await session.execute(query)).scalars().unique().all()
+
+    # Batch-fetch scores for all researches in one query
+    research_ids = [r.id for r in rows]
+    scores_map: dict[str, float] = {}
+    if research_ids:
+        from app.db.models import Review
+        rv_rows = (await session.execute(
+            select(Review.research_id, Review.overall_score)
+            .where(Review.research_id.in_(research_ids))
+        )).all()
+        scores_map = {rid: sc for rid, sc in rv_rows}
+
     return [
         ResearchSummary(
             id=r.id, title=r.title, status=r.status, priority=r.priority, depth=r.depth,
-            score=8.4 if r.status == "completed" else None,
+            score=round(scores_map.get(r.id, 0.0), 1) if r.status == "completed" else None,
             tags=[{"id": t.id, "name": t.name, "color": t.color} for t in r.tags],
             created_at=r.created_at, updated_at=r.updated_at,
         ) for r in rows
