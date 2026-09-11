@@ -176,7 +176,7 @@ def _validate_and_fix_workload_yaml(w: dict) -> dict:
                 if isinstance(tm, dict):
                     _fix_label_map(tm, "labels")
 
-        if kind == "Deployment":
+        if kind in ("Deployment", "StatefulSet", "Job", "ReplicaSet", "DaemonSet"):
             template = spec.get("template", {}).get("spec", {})
             containers = template.get("containers", [])
             for c in containers:
@@ -209,6 +209,77 @@ def _validate_and_fix_workload_yaml(w: dict) -> dict:
                         if "$((" in cmd:
                             cmd = _re_fix.sub(r'\$\(\(\$RANDOM\+(\d+)\)\)', r'\1', cmd)
                             c["args"] = [cmd]
+
+                    # ── Repair entrypoint override ──────────────────────
+                    # The official mysql image's ENTRYPOINT
+                    # (docker-entrypoint.sh) performs first-boot data-dir
+                    # initialization. K8s `command` OVERRIDES the ENTRYPOINT,
+                    # so an LLM that writes either
+                    #   command: ["/bin/sh","-c"] args: ["mysqld ..."]
+                    #   command: ["mysqld","--server-id=1", ...]
+                    # skips that init → mysqld aborts instantly
+                    # ("Failed to find valid data directory" MY-011011) →
+                    # CrashLoopBackOff, pod never Ready. Rewrite to the
+                    # entrypoint-compatible form: drop `command`, put
+                    # `mysqld ...` in `args` (entrypoint detects it).
+                    _my_command = c.get("command") or []
+                    _my_args = c.get("args") or []
+
+                    def _tok(text: str) -> list[str]:
+                        import shlex as _shlex
+                        try:
+                            return _shlex.split(str(text))
+                        except Exception:
+                            return str(text).split()
+
+                    _flags: list[str] | None = None
+                    _shell_bins = {"sh", "bash", "dash"}
+                    _is_shell = bool(_my_command) and any(
+                        str(x).split("/")[-1] in _shell_bins for x in _my_command
+                    )
+                    if _is_shell:
+                        _text = " ".join(str(a) for a in _my_args) if _my_args else ""
+                        if not _text and len(_my_command) >= 3:
+                            _text = str(_my_command[-1])
+                        _toks = _tok(_text)
+                        if "mysqld" in _toks:
+                            _flags = _toks[_toks.index("mysqld"):]
+                    else:
+                        _all = [str(x) for x in _my_command] + [str(x) for x in _my_args]
+                        _idx = next((k for k, x in enumerate(_all)
+                                     if x.split("/")[-1] == "mysqld"), None)
+                        if _idx is not None:
+                            _flags = _all[_idx:]
+                    if _flags:
+                        c.pop("command", None)
+                        c["args"] = _flags
+                        logger.info(
+                            "workload %s: repaired mysqld entrypoint override → args "
+                            "(docker-entrypoint.sh init will now run)", w.get("name"),
+                        )
+
+                # Repair an existing MySQL readinessProbe that uses the
+                # broken split `-p password` form (interactive prompt → probe
+                # always fails → pod never Ready). Force the --password= form.
+                if "mysql" in image.lower() and isinstance(c.get("readinessProbe"), dict):
+                    _probe = c["readinessProbe"]
+                    _exec = _probe.get("exec") if isinstance(_probe.get("exec"), dict) else None
+                    _pcmd = _exec.get("command") if _exec else None
+                    if isinstance(_pcmd, list):
+                        _fixed_pcmd = []
+                        _skip_next = False
+                        for _i, _p in enumerate(_pcmd):
+                            if _skip_next:
+                                _skip_next = False
+                                continue
+                            if str(_p) == "-p" and _i + 1 < len(_pcmd):
+                                _fixed_pcmd.append(f"--password={_pcmd[_i + 1]}")
+                                _skip_next = True
+                            else:
+                                _fixed_pcmd.append(_p)
+                        if _fixed_pcmd != _pcmd:
+                            _exec["command"] = _fixed_pcmd
+                            logger.info("workload %s: repaired readinessProbe -p form", w.get("name"))
 
                 # Ensure readinessProbe for long-running containers
                 if "readinessProbe" not in c:
@@ -543,13 +614,174 @@ def _make_busybox_workload(name: str, app_label: str, namespace: str, image: str
     return yaml.safe_dump(dep)
 
 
+def _sync_service_selectors(workloads: list[dict]) -> int:
+    """Repair Service selectors that don't match any pod template labels.
+
+    The LLM sometimes writes `Service.spec.selector: {role: master}` while
+    the Deployment pod template only carries `app: mysql-master` → the
+    Service has no endpoints, so service_ready checks fail and verifier
+    Jobs can't resolve the hostname.  When a Service's selector matches no
+    Deployment/StatefulSet pod template, and the Service name corresponds
+    to a workload name, rewrite the selector to that workload's pod labels.
+    """
+    dep_labels: dict[str, dict] = {}
+    for w in workloads:
+        try:
+            for doc in yaml.safe_load_all(w.get("yaml", "")):
+                if not isinstance(doc, dict):
+                    continue
+                if doc.get("kind") not in ("Deployment", "StatefulSet", "DaemonSet"):
+                    continue
+                name = (doc.get("metadata") or {}).get("name", "")
+                labels = ((((doc.get("spec") or {}).get("template") or {})
+                           .get("metadata") or {}).get("labels")) or {}
+                if name and isinstance(labels, dict) and labels:
+                    dep_labels[str(name)] = dict(labels)
+        except Exception:
+            pass
+
+    def _matches(sel: dict, labels: dict) -> bool:
+        return bool(sel) and all(labels.get(k) == v for k, v in sel.items())
+
+    all_label_sets = list(dep_labels.values())
+    fixed = 0
+    for w in workloads:
+        try:
+            docs = [d for d in yaml.safe_load_all(w.get("yaml", ""))
+                    if isinstance(d, dict) and d.get("kind") == "Service"]
+            if not docs:
+                continue
+            doc = docs[0]
+            sel = (doc.get("spec") or {}).get("selector") or {}
+            if any(_matches(sel, labels) for labels in all_label_sets):
+                continue
+            svc_name = str((doc.get("metadata") or {}).get("name", ""))
+            target = dep_labels.get(svc_name)
+            if target is None:
+                for dname, labels in dep_labels.items():
+                    if svc_name.startswith(dname) or dname.startswith(svc_name.rstrip("-svc")):
+                        target = labels
+                        break
+            if target:
+                doc.setdefault("spec", {})["selector"] = dict(target)
+                w["yaml"] = yaml.safe_dump(doc)
+                fixed += 1
+                logger.info("synced Service %s selector → %s", svc_name, target)
+        except Exception as e:
+            logger.warning("service-selector sync skipped for %s: %s", w.get("name"), e)
+    return fixed
+
+
+def _auto_ensure_services(workloads: list[dict], namespace: str) -> list[dict]:
+    """Ensure every database Deployment has a Service so verifier Jobs /
+    probes can reach it by DNS name.
+
+    Verify templates use Service names (mysql-master / mysql-slave) as
+    MASTER_HOST / SLAVE_HOST.  When the LLM only emits Deployments
+    without a matching Service, the verifier's `mysql -h <name>` fails
+    DNS resolution.  Scan Deployments that expose a known DB port; if no
+    Service selects that Deployment's app label, synthesize one (named
+    after the Deployment so hostnames match the workload name).
+    """
+    DB_PORTS = {
+        "mysql": 3306, "mariadb": 3306, "postgres": 5432,
+        "redis": 6379, "mongo": 27017, "mongodb": 27017,
+    }
+    existing_svc_selectors: list[str] = []
+    existing_svc_names: set[str] = set()
+    appended = 0
+    # Pass 1: collect every Service (standalone workload entries AND docs
+    # bundled inside a multi-doc yaml) so we never synthesize a duplicate.
+    for w in workloads:
+        try:
+            for doc in yaml.safe_load_all(w.get("yaml", "")):
+                if not isinstance(doc, dict) or doc.get("kind") != "Service":
+                    continue
+                sel = (doc.get("spec") or {}).get("selector") or {}
+                sm_name = (doc.get("metadata") or {}).get("name", "")
+                if sm_name:
+                    existing_svc_names.add(str(sm_name).lower())
+                for k, v in sel.items():
+                    existing_svc_selectors.append(f"{k}={v}")
+        except Exception:
+            pass
+    base = len(workloads)
+    for w in workloads:
+        if str(w.get("kind", "")) not in ("Deployment", "StatefulSet"):
+            continue
+        try:
+            docs = [d for d in yaml.safe_load_all(w.get("yaml", ""))
+                    if isinstance(d, dict)]
+            if not docs:
+                continue
+            dep_doc = next((d for d in docs if d.get("kind") in ("Deployment", "StatefulSet")), None)
+            if dep_doc is None:
+                continue
+            meta = dep_doc.get("metadata") or {}
+            dep_name = str(meta.get("name", w.get("name", "")))
+            if dep_name.lower() in existing_svc_names:
+                continue
+            tmpl_labels = ((((dep_doc.get("spec") or {}).get("template") or {})
+                            .get("metadata") or {}).get("labels")) or {}
+            app = str(tmpl_labels.get("app")
+                      or (dep_doc.get("spec") or {}).get("selector", {}).get("matchLabels", {}).get("app", "")
+                      or dep_name)
+            # Only auto-Service deployments whose image is a known DB
+            image = str(w.get("image") or "")
+            port = None
+            for key, p in DB_PORTS.items():
+                if key in image.lower():
+                    port = p
+                    break
+            if port is None:
+                # Infer from container ports if image hint is absent
+                containers = ((dep_doc.get("spec") or {}).get("template") or {}).get("spec", {}).get("containers") or []
+                for c in containers:
+                    for prt in (c.get("ports") or []):
+                        if prt.get("containerPort") in (3306, 5432, 6379, 27017):
+                            port = prt["containerPort"]
+                            break
+            if port is None:
+                continue
+            sel_str = f"app={app}"
+            if sel_str in existing_svc_selectors:
+                continue
+            svc = {
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {"name": dep_name, "namespace": namespace, "labels": {"app": app}},
+                "spec": {
+                    "selector": {"app": app},
+                    "ports": [{"port": port, "targetPort": port,
+                               "name": str(app)[:15]}],
+                    "type": "ClusterIP",
+                },
+            }
+            workloads.append({
+                "name": dep_name,
+                "kind": "Service",
+                "image": "",
+                "replicas": 1,
+                "yaml": yaml.safe_dump(svc),
+                "_auto": True,
+                "_auto_service": True,
+            })
+            existing_svc_selectors.append(sel_str)
+            existing_svc_names.add(dep_name.lower())
+            appended += 1
+            logger.info("auto-created Service %s for Deployment %s (port %s)", dep_name, dep_name, port)
+        except Exception as e:
+            logger.warning("auto-Service skipped for %s: %s", w.get("name"), e)
+    return workloads[base:]
+
+
 # ──────────────────────────────────────────────────────────────────
 # Verification Templates
 # ──────────────────────────────────────────────────────────────────
 # Each template defines a workload generator + check expectation for a
 # common verification pattern.  LLM plans reference templates by key
 # in check targets (e.g. "target: verify:mysql_check_replication"),
-# and _validate_plan auto-generates the corresponding Deployment + check.
+# and _validate_plan auto-generates the corresponding batch/v1 Job + check.
 # This bridges the gap between "what to verify" (LLM's strength) and
 # "how to execute it" (system's strength).
 
@@ -557,20 +789,34 @@ def _make_mysql_verify_workload(name: str, app_label: str, namespace: str,
                                 script: str, master: str = "mysql-master",
                                 slave: str = "mysql-slave",
                                 memory: str = "256Mi") -> str:
-    """Generate a MySQL-client verification Deployment that runs a script
-    connecting to master/slave services and echoing result markers."""
+    """Generate a MySQL-client verification Job that runs a script
+    connecting to master/slave services and echoing result markers.
+
+    Deliberately a batch/v1 Job (not a Deployment): a verifier runs its
+    script once and exits.  With a Deployment + restartPolicy=Always the
+    container restarts on exit, which wipes the pod logs — so the
+    pod_log_match check raced against the restart AND write_verify kept
+    re-inserting rows on every restart.  A Job keeps its completed pod
+    (logs persist for pod_log_match), never restarts (backoffLimit=0 /
+    restartPolicy=Never), and is deleted by namespace cleanup.
+    """
     import shlex
-    dep = {
-        "apiVersion": "apps/v1",
-        "kind": "Deployment",
+    # Script max runtime: the longest template wait-loop is ~60s of
+    # connection retries + query time; give generous headroom.  Checks
+    # poll logs while the Job runs, so this must exceed the check timeout
+    # of the slowest template check (180s) plus script execution.
+    deadline_sec = 600
+    job = {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
         "metadata": {"name": name, "namespace": namespace, "labels": {"app": app_label}},
         "spec": {
-            "replicas": 1,
-            "selector": {"matchLabels": {"app": app_label}},
+            "backoffLimit": 0,
+            "activeDeadlineSeconds": deadline_sec,
             "template": {
                 "metadata": {"labels": {"app": app_label}},
                 "spec": {
-                    "restartPolicy": "Always",
+                    "restartPolicy": "Never",
                     "containers": [{
                         "name": "validator",
                         "image": "registry.adms.io:31542/library/mysql:8.0.32",
@@ -588,7 +834,7 @@ def _make_mysql_verify_workload(name: str, app_label: str, namespace: str,
             },
         },
     }
-    return yaml.safe_dump(dep)
+    return yaml.safe_dump(job)
 
 
 VERIFY_TEMPLATES: dict[str, dict] = {
@@ -599,14 +845,20 @@ VERIFY_TEMPLATES: dict[str, dict] = {
         "image_type": "mysql",
         "script": (
             "echo 'WAITING FOR SLAVE TO BE READY...';"
-            " for i in $(seq 1 30); do"
+            " for i in $(seq 1 45); do"
             "   if mysql -h $SLAVE_HOST -u root -e 'SELECT 1' >/dev/null 2>&1; then break; fi;"
             "   sleep 2;"
             " done;"
             " echo 'CHECKING REPLICATION STATUS';"
-            " IO=$(mysql -h $SLAVE_HOST -u root -e \"SHOW SLAVE STATUS\\G\" 2>/dev/null | grep Slave_IO_Running | awk '{print $2}');"
-            " SQL=$(mysql -h $SLAVE_HOST -u root -e \"SHOW SLAVE STATUS\\G\" 2>/dev/null | grep Slave_SQL_Running | awk '{print $2}');"
-            " DELAY=$(mysql -h $SLAVE_HOST -u root -e \"SHOW SLAVE STATUS\\G\" 2>/dev/null | grep Seconds_Behind_Master | awk '{print $2}');"
+            " IO=NOT_FOUND; SQL=NOT_FOUND; DELAY=NOT_FOUND;"
+            " for i in $(seq 1 45); do"
+            "   ST=$(mysql -h $SLAVE_HOST -u root -e \"SHOW SLAVE STATUS\\G\" 2>/dev/null);"
+            "   IO=$(echo \"$ST\" | grep -E 'Slave_IO_Running:' | awk '{print $2}' | tr -d ' ');"
+            "   SQL=$(echo \"$ST\" | grep -E 'Slave_SQL_Running:' | awk '{print $2}' | tr -d ' ');"
+            "   DELAY=$(echo \"$ST\" | grep -E 'Seconds_Behind_Master:' | awk '{print $2}' | tr -d ' ');"
+            "   if [ \"$IO\" = \"Yes\" ] && [ \"$SQL\" = \"Yes\" ]; then break; fi;"
+            "   sleep 2;"
+            " done;"
             " echo IO_THREAD_OK=${IO:-NOT_FOUND};"
             " echo SQL_THREAD_OK=${SQL:-NOT_FOUND};"
             " echo REPLICATION_DELAY=${DELAY:-NOT_FOUND};"
@@ -625,7 +877,7 @@ VERIFY_TEMPLATES: dict[str, dict] = {
         "image_type": "mysql",
         "script": (
             "echo 'WAITING FOR SERVICES...';"
-            " for i in $(seq 1 15); do"
+            " for i in $(seq 1 45); do"
             "   if mysql -h $MASTER_HOST -u root -e 'SELECT 1' >/dev/null 2>&1; then break; fi;"
             "   sleep 2;"
             " done;"
@@ -650,7 +902,7 @@ VERIFY_TEMPLATES: dict[str, dict] = {
         "image_type": "mysql",
         "script": (
             "echo 'WAITING FOR MASTER...';"
-            " for i in $(seq 1 15); do"
+            " for i in $(seq 1 45); do"
             "   if mysql -h $MASTER_HOST -u root -e 'SELECT 1' >/dev/null 2>&1; then break; fi;"
             "   sleep 2;"
             " done;"
@@ -671,11 +923,11 @@ VERIFY_TEMPLATES: dict[str, dict] = {
         "image_type": "mysql",
         "script": (
             "echo 'WAITING FOR SERVICES...';"
-            " for i in $(seq 1 15); do"
+            " for i in $(seq 1 45); do"
             "   if mysql -h $MASTER_HOST -u root -e 'SELECT 1' >/dev/null 2>&1; then break; fi;"
             "   sleep 2;"
             " done;"
-            " for i in $(seq 1 15); do"
+            " for i in $(seq 1 45); do"
             "   if mysql -h $SLAVE_HOST -u root -e 'SELECT 1' >/dev/null 2>&1; then break; fi;"
             "   sleep 2;"
             " done;"
@@ -698,7 +950,7 @@ VERIFY_TEMPLATES: dict[str, dict] = {
         "image_type": "mysql",
         "script": (
             "echo 'WAITING FOR MASTER...';"
-            " for i in $(seq 1 30); do"
+            " for i in $(seq 1 45); do"
             "   if mysql -h $MASTER_HOST -u root -e 'SELECT 1' >/dev/null 2>&1; then break; fi;"
             "   sleep 2;"
             " done;"
@@ -714,7 +966,7 @@ VERIFY_TEMPLATES: dict[str, dict] = {
             " MC=$(mysql -h $MASTER_HOST -u root -N -e \"SELECT COUNT(*) FROM repl_test.verify_data;\" 2>/dev/null);"
             " echo MASTER_ROW_COUNT=${MC:-0};"
             " echo 'WAITING FOR REPLICATION...';"
-            " for i in $(seq 1 30); do"
+            " for i in $(seq 1 45); do"
             "   CNT=$(mysql -h $SLAVE_HOST -u root -N -e \"SELECT COUNT(*) FROM repl_test.verify_data;\" 2>/dev/null);"
             "   if [ \"$CNT\" = \"10\" ]; then"
             "     echo SLAVE_ROW_COUNT=$CNT;"
@@ -742,7 +994,7 @@ VERIFY_TEMPLATES: dict[str, dict] = {
         "image_type": "mysql",
         "script": (
             "echo 'WAITING FOR MASTER...';"
-            " for i in $(seq 1 15); do"
+            " for i in $(seq 1 45); do"
             "   if mysql -h $MASTER_HOST -u root -e 'SELECT 1' >/dev/null 2>&1; then break; fi;"
             "   sleep 2;"
             " done;"
@@ -1194,10 +1446,24 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
                 if kind in ("Deployment", "ReplicaSet", "StatefulSet", "DaemonSet") and tmpl_spec is not None:
                     if tmpl_spec.get("restartPolicy", "Always") != "Always":
                         tmpl_spec["restartPolicy"] = "Always"
+                # Resolve the image: prefer the plan's top-level field, else
+                # pull it from the first container in the manifest so we can
+                # mirror it into Harbor. Avoid the str(None) == "None" trap.
+                _img = w.get("image")
+                if not _img:
+                    try:
+                        _tmpl_containers = (
+                            ((doc.get("spec") or {}).get("template") or {})
+                            .get("spec", {}).get("containers") or []
+                        )
+                        if isinstance(_tmpl_containers, list) and _tmpl_containers:
+                            _img = _tmpl_containers[0].get("image")
+                    except Exception:
+                        _img = None
                 cleaned_workloads.append({
                     "name": str(doc["metadata"].get("name", f"wl-{len(cleaned_workloads)}"))[:50],
                     "kind": kind or "Deployment",
-                    "image": str(w.get("image", ""))[:200],
+                    "image": (str(_img)[:200] if _img else ""),
                     "replicas": max(1, int(w.get("replicas") or 1)),
                     "yaml": yaml.safe_dump(doc),
                 })
@@ -1280,7 +1546,7 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
             )
             cleaned_workloads.append({
                 "name": wl_name,
-                "kind": "Deployment",
+                "kind": "Job",
                 "image": f"registry.adms.io:31542/library/mysql:8.0.32",
                 "replicas": 1,
                 "yaml": wl_yaml,
@@ -1351,6 +1617,11 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
 
     if auto_generated:
         cleaned_workloads = cleaned_workloads + auto_generated[:MAX_WORKLOADS - len(cleaned_workloads)]
+
+    # Ensure each database Deployment has a Service so verifier Jobs can
+    # reach it by DNS hostname (mysql-master / mysql-slave, etc.).
+    _sync_service_selectors(cleaned_workloads)
+    _auto_ensure_services(cleaned_workloads, namespace)
 
     cleaned_checks = []
     for c in checks:
@@ -1524,7 +1795,7 @@ async def _check_pod_ready(kc_path: str, ns: str, target: str, timeout_sec: int,
             timeout=10,
         )
         if rc == 0 and out.strip():
-            ready = "True" in out or 'running' in out.lower()
+            ready = "True" in out or 'running' in out.lower() or 'succeeded' in out.lower()
             # Build a human-readable status line from the raw pod output.
             status_line = ""
             for line in out.splitlines():
