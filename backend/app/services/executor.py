@@ -288,7 +288,7 @@ async def run_research_job(research_id: str, timeout_sec: int = 1800) -> None:
         raise
 
 
-async def recover_stuck_research(idle_seconds: int = 300) -> int:
+async def recover_stuck_research(idle_seconds: int = 900) -> int:
     """Mark research stuck in 'running' state for too long as 'failed'.
 
     Used on uvicorn startup to clean up after previous runs that were killed
