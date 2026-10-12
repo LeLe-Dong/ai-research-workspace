@@ -76,6 +76,28 @@ def _assert_safe_namespace(ns: str) -> None:
     )
 
 
+async def _kubeconfig_auth_ok(path: str) -> bool:
+    """Return True if the kubeconfig authenticates against the API server.
+
+    Uses ``kubectl auth can-i create pods -n airw-research`` — a
+    SelfSubjectAccessReview that fails fast on a rejected/expired token
+    ("Unauthorized" / "credentials") but succeeds (yes/no) whenever the
+    credential itself is accepted, even if the SA lacks wider permissions.
+    """
+    try:
+        _rc, out, err = await _kubectl_async(
+            ["--kubeconfig", path, "auth", "can-i", "create", "pods",
+             "-n", "airw-research"],
+            timeout=12,
+        )
+    except Exception:
+        return False
+    text = f"{out} {err}".lower()
+    if "unauthorized" in text or "credentials" in text:
+        return False
+    return out.strip() in ("yes", "no")
+
+
 async def _load_kubeconfig() -> tuple[str, dict]:
     """Load the first configured K8s cluster. Returns (path_to_tempfile, meta_dict).
 
@@ -152,6 +174,33 @@ async def _load_kubeconfig() -> tuple[str, dict]:
     fd, path = tempfile.mkstemp(suffix=".yaml", prefix="airw-k8s-")
     with os.fdopen(fd, "w") as f:
         yaml.safe_dump(config, f)
+
+    # Validate the credential before handing it to the runner. An SA token
+    # stored in the DB can decrypt fine yet be EXPIRED, in which case every
+    # call returns "Unauthorized" and the whole experiment fails at namespace
+    # creation. Probe once; on rejection fall back to the file kubeconfig.
+    if not await _kubeconfig_auth_ok(path):
+        if os.path.exists(FALLBACK_KUBECONFIG_PATH) and await _kubeconfig_auth_ok(FALLBACK_KUBECONFIG_PATH):
+            logger.warning(
+                "DB cluster %r credentials rejected by the API server "
+                "(expired/revoked token?); falling back to %s",
+                cluster.name, FALLBACK_KUBECONFIG_PATH,
+            )
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            with open(FALLBACK_KUBECONFIG_PATH) as f:
+                fb = yaml.safe_load(f)
+            return FALLBACK_KUBECONFIG_PATH, {
+                "name": fb.get("clusters", [{}])[0].get("name", "fallback"),
+                "source": "file (db token rejected)",
+                "namespace": cluster.default_namespace,
+            }
+        logger.warning(
+            "DB cluster %r credentials rejected by the API server and no "
+            "working file fallback is available", cluster.name,
+        )
 
     meta = {"name": cluster.name, "source": "db", "namespace": cluster.default_namespace}
     return path, meta
