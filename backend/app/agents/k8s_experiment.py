@@ -29,11 +29,13 @@ import asyncio
 import json
 import logging
 import os
+from collections.abc import AsyncIterator
 
 import yaml
 
 from app.agents.base import AgentEvent
 from app.agents.k8s import (
+    DEFAULT_NAMESPACE,
     derive_experiment_ns,
     _assert_safe_namespace,
     _load_kubeconfig,
@@ -53,6 +55,9 @@ ALLOWED_CHECK_TYPES = ("pod_ready", "service_ready", "pod_log_match", "http_ok")
 # Hard cap so a misbehaving LLM can't make us apply 50 resources.
 MAX_WORKLOADS = 10
 MAX_CHECKS = 15
+# Bound on concurrently-running checks. Checks are mostly log-tailing the
+# same small set of pods, so this is generous while avoiding a kubectl storm.
+MAX_PARALLEL_CHECKS = 8
 
 
 def _validate_and_fix_workload_yaml(w: dict) -> dict:
@@ -311,6 +316,41 @@ def _to_short_ref(image: str) -> str:
     """Reduce an image ref to `<name>:<tag>` for console display."""
     from app.agents.k8s_image import _to_short_name
     return _to_short_name(image)
+
+
+# Keys a check target may prefix a resource with, e.g. "service=mysql-master",
+# "deployment/redis", "app=web". Used to reduce a target to its bare name so
+# it matches against deployed workloads.
+_TARGET_PREFIX_KEYS = frozenset({
+    "app", "service", "svc", "deployment", "deploy", "statefulset", "sts",
+    "daemonset", "ds", "replicaset", "rs", "job", "pod", "container", "name",
+})
+
+
+def _normalize_target_ref(target: str) -> str:
+    """Reduce a check target to the bare workload/service name it refers to.
+
+    Handles 'app=x', 'service=x', 'svc=x', 'deployment/x' and 'x'.  Matters so
+    that e.g. a check target 'service=mysql-master' matches the existing
+    mysql-master Deployment instead of spawning a bogus auto-service=... 
+    workload (which is also an invalid RFC-1123 name).
+    """
+    t = str(target or "").strip()
+    if "/" in t:
+        t = t.split("/")[-1].strip()
+    if "=" in t:
+        k, _, v = t.partition("=")
+        if k.strip().lower() in _TARGET_PREFIX_KEYS and v.strip():
+            return v.strip()
+    return t
+
+
+def _sanitize_k8s_name(name: str) -> str:
+    """Coerce a string into a valid RFC-1123 subdomain (lowercase alnum/-)."""
+    import re as _re
+    s = _re.sub(r"[^a-z0-9-]", "-", str(name).lower())
+    s = _re.sub(r"-+", "-", s).strip("-")
+    return s[:50] or "wl"
 
 
 def _resolve_mysql_image(workloads: list[dict]) -> str:
@@ -709,6 +749,10 @@ def _auto_ensure_services(workloads: list[dict], namespace: str) -> list[dict]:
     for w in workloads:
         if str(w.get("kind", "")) not in ("Deployment", "StatefulSet"):
             continue
+        # Verifier workloads run a client script (not a server); they don't
+        # need a Service even though they use a database image.
+        if w.get("_verify_template") or w.get("_auto_service"):
+            continue
         try:
             docs = [d for d in yaml.safe_load_all(w.get("yaml", ""))
                     if isinstance(d, dict)]
@@ -789,39 +833,40 @@ def _make_mysql_verify_workload(name: str, app_label: str, namespace: str,
                                 script: str, master: str = "mysql-master",
                                 slave: str = "mysql-slave",
                                 memory: str = "256Mi") -> str:
-    """Generate a MySQL-client verification Job that runs a script
+    """Generate a MySQL-client verification Deployment that runs a script
     connecting to master/slave services and echoing result markers.
 
-    Deliberately a batch/v1 Job (not a Deployment): a verifier runs its
-    script once and exits.  With a Deployment + restartPolicy=Always the
-    container restarts on exit, which wipes the pod logs — so the
-    pod_log_match check raced against the restart AND write_verify kept
-    re-inserting rows on every restart.  A Job keeps its completed pod
-    (logs persist for pod_log_match), never restarts (backoffLimit=0 /
-    restartPolicy=Never), and is deleted by namespace cleanup.
+    A Deployment (not a Job) because the restricted shared-namespace
+    credential (airw-bot) has NO RBAC for batch/v1 Jobs.  To avoid the
+    restart-on-exit problem that originally motivated Jobs, the wrapper
+    script ends with ``sleep`` so the container NEVER exits: the pod stays
+    Running, so pod_log_match can read the markers at any time and
+    write_verify runs exactly once (no duplicate inserts, no log wipe).
+    The Deployment is removed by cleanup.
     """
-    import shlex
-    # Script max runtime: the longest template wait-loop is ~60s of
-    # connection retries + query time; give generous headroom.  Checks
-    # poll logs while the Job runs, so this must exceed the check timeout
-    # of the slowest template check (180s) plus script execution.
-    deadline_sec = 600
-    job = {
-        "apiVersion": "batch/v1",
-        "kind": "Job",
+    # Never let the shell exit: guarantees restartPolicy=Always never
+    # restarts the container (which would wipe logs / re-run side effects).
+    wrapped = (
+        "set +e; "
+        + script
+        + "; echo VERIFY_SCRIPT_DONE; exec sleep 3600"
+    )
+    dep = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
         "metadata": {"name": name, "namespace": namespace, "labels": {"app": app_label}},
         "spec": {
-            "backoffLimit": 0,
-            "activeDeadlineSeconds": deadline_sec,
+            "replicas": 1,
+            "selector": {"matchLabels": {"app": app_label}},
             "template": {
                 "metadata": {"labels": {"app": app_label}},
                 "spec": {
-                    "restartPolicy": "Never",
+                    "restartPolicy": "Always",
                     "containers": [{
                         "name": "validator",
                         "image": "registry.adms.io:31542/library/mysql:8.0.32",
                         "command": ["/bin/sh", "-c"],
-                        "args": [script],
+                        "args": [wrapped],
                         "env": [
                             {"name": "MYSQL_PWD", "value": "airwtest123"},
                             {"name": "MASTER_HOST", "value": master},
@@ -834,7 +879,7 @@ def _make_mysql_verify_workload(name: str, app_label: str, namespace: str,
             },
         },
     }
-    return yaml.safe_dump(job)
+    return yaml.safe_dump(dep)
 
 
 VERIFY_TEMPLATES: dict[str, dict] = {
@@ -845,13 +890,13 @@ VERIFY_TEMPLATES: dict[str, dict] = {
         "image_type": "mysql",
         "script": (
             "echo 'WAITING FOR SLAVE TO BE READY...';"
-            " for i in $(seq 1 45); do"
+            " for i in $(seq 1 75); do"
             "   if mysql -h $SLAVE_HOST -u root -e 'SELECT 1' >/dev/null 2>&1; then break; fi;"
             "   sleep 2;"
             " done;"
             " echo 'CHECKING REPLICATION STATUS';"
             " IO=NOT_FOUND; SQL=NOT_FOUND; DELAY=NOT_FOUND;"
-            " for i in $(seq 1 45); do"
+            " for i in $(seq 1 75); do"
             "   ST=$(mysql -h $SLAVE_HOST -u root -e \"SHOW SLAVE STATUS\\G\" 2>/dev/null);"
             "   IO=$(echo \"$ST\" | grep -E 'Slave_IO_Running:' | awk '{print $2}' | tr -d ' ');"
             "   SQL=$(echo \"$ST\" | grep -E 'Slave_SQL_Running:' | awk '{print $2}' | tr -d ' ');"
@@ -877,7 +922,7 @@ VERIFY_TEMPLATES: dict[str, dict] = {
         "image_type": "mysql",
         "script": (
             "echo 'WAITING FOR SERVICES...';"
-            " for i in $(seq 1 45); do"
+            " for i in $(seq 1 75); do"
             "   if mysql -h $MASTER_HOST -u root -e 'SELECT 1' >/dev/null 2>&1; then break; fi;"
             "   sleep 2;"
             " done;"
@@ -891,7 +936,7 @@ VERIFY_TEMPLATES: dict[str, dict] = {
             " if [ \"$M_Gtid\" = \"ON\" ] && [ \"$S_Gtid\" = \"ON\" ]; then echo GTID_VERIFIED=ON; else echo GTID_VERIFIED=OFF; fi;"
         ),
         "checks": [
-            {"type": "pod_log_match", "expect": "GTID_VERIFIED=ON", "timeout_sec": 120},
+            {"type": "pod_log_match", "expect": "GTID_VERIFIED=ON", "timeout_sec": 180},
         ],
     },
 
@@ -902,7 +947,7 @@ VERIFY_TEMPLATES: dict[str, dict] = {
         "image_type": "mysql",
         "script": (
             "echo 'WAITING FOR MASTER...';"
-            " for i in $(seq 1 45); do"
+            " for i in $(seq 1 75); do"
             "   if mysql -h $MASTER_HOST -u root -e 'SELECT 1' >/dev/null 2>&1; then break; fi;"
             "   sleep 2;"
             " done;"
@@ -912,7 +957,7 @@ VERIFY_TEMPLATES: dict[str, dict] = {
             " if [ \"$FMT\" = \"ROW\" ]; then echo BINLOG_VERIFIED=ROW; else echo BINLOG_VERIFIED=$FMT; fi;"
         ),
         "checks": [
-            {"type": "pod_log_match", "expect": "BINLOG_VERIFIED=ROW", "timeout_sec": 120},
+            {"type": "pod_log_match", "expect": "BINLOG_VERIFIED=ROW", "timeout_sec": 180},
         ],
     },
 
@@ -923,11 +968,11 @@ VERIFY_TEMPLATES: dict[str, dict] = {
         "image_type": "mysql",
         "script": (
             "echo 'WAITING FOR SERVICES...';"
-            " for i in $(seq 1 45); do"
+            " for i in $(seq 1 75); do"
             "   if mysql -h $MASTER_HOST -u root -e 'SELECT 1' >/dev/null 2>&1; then break; fi;"
             "   sleep 2;"
             " done;"
-            " for i in $(seq 1 45); do"
+            " for i in $(seq 1 75); do"
             "   if mysql -h $SLAVE_HOST -u root -e 'SELECT 1' >/dev/null 2>&1; then break; fi;"
             "   sleep 2;"
             " done;"
@@ -939,7 +984,7 @@ VERIFY_TEMPLATES: dict[str, dict] = {
             " if [ \"$M_RO\" = \"0\" ] && [ \"$S_RO\" = \"1\" ]; then echo READ_ONLY_VERIFIED=OK; else echo READ_ONLY_VERIFIED=FAIL; fi;"
         ),
         "checks": [
-            {"type": "pod_log_match", "expect": "READ_ONLY_VERIFIED=OK", "timeout_sec": 120},
+            {"type": "pod_log_match", "expect": "READ_ONLY_VERIFIED=OK", "timeout_sec": 180},
         ],
     },
 
@@ -950,7 +995,7 @@ VERIFY_TEMPLATES: dict[str, dict] = {
         "image_type": "mysql",
         "script": (
             "echo 'WAITING FOR MASTER...';"
-            " for i in $(seq 1 45); do"
+            " for i in $(seq 1 75); do"
             "   if mysql -h $MASTER_HOST -u root -e 'SELECT 1' >/dev/null 2>&1; then break; fi;"
             "   sleep 2;"
             " done;"
@@ -966,22 +1011,26 @@ VERIFY_TEMPLATES: dict[str, dict] = {
             " MC=$(mysql -h $MASTER_HOST -u root -N -e \"SELECT COUNT(*) FROM repl_test.verify_data;\" 2>/dev/null);"
             " echo MASTER_ROW_COUNT=${MC:-0};"
             " echo 'WAITING FOR REPLICATION...';"
-            " for i in $(seq 1 45); do"
+            " FOUND=0;"
+            " for i in $(seq 1 75); do"
             "   CNT=$(mysql -h $SLAVE_HOST -u root -N -e \"SELECT COUNT(*) FROM repl_test.verify_data;\" 2>/dev/null);"
             "   if [ \"$CNT\" = \"10\" ]; then"
             "     echo SLAVE_ROW_COUNT=$CNT;"
             "     echo ROW_COUNT_MATCH=true;"
             "     echo REPLICATION_VERIFIED=true;"
-            "     exit 0;"
+            "     FOUND=1;"
+            "     break;"
             "   fi;"
             "   sleep 2;"
             " done;"
-            " echo SLAVE_ROW_COUNT=${CNT:-0};"
-            " echo ROW_COUNT_MATCH=false;"
-            " echo REPLICATION_VERIFIED=false;"
+            " if [ \"$FOUND\" != \"1\" ]; then"
+            "   echo SLAVE_ROW_COUNT=${CNT:-0};"
+            "   echo ROW_COUNT_MATCH=false;"
+            "   echo REPLICATION_VERIFIED=false;"
+            " fi;"
         ),
         "checks": [
-            {"type": "pod_log_match", "expect": "MASTER_ROW_COUNT=10", "timeout_sec": 60},
+            {"type": "pod_log_match", "expect": "MASTER_ROW_COUNT=10", "timeout_sec": 180},
             {"type": "pod_log_match", "expect": "ROW_COUNT_MATCH=true", "timeout_sec": 180},
             {"type": "pod_log_match", "expect": "REPLICATION_VERIFIED=true", "timeout_sec": 180},
         ],
@@ -994,7 +1043,7 @@ VERIFY_TEMPLATES: dict[str, dict] = {
         "image_type": "mysql",
         "script": (
             "echo 'WAITING FOR MASTER...';"
-            " for i in $(seq 1 45); do"
+            " for i in $(seq 1 75); do"
             "   if mysql -h $MASTER_HOST -u root -e 'SELECT 1' >/dev/null 2>&1; then break; fi;"
             "   sleep 2;"
             " done;"
@@ -1007,7 +1056,7 @@ VERIFY_TEMPLATES: dict[str, dict] = {
             " echo BENCHMARK_DONE;"
         ),
         "checks": [
-            {"type": "pod_log_match", "expect": "BENCHMARK_DONE", "timeout_sec": 120},
+            {"type": "pod_log_match", "expect": "BENCHMARK_DONE", "timeout_sec": 180},
         ],
     },
 }
@@ -1107,11 +1156,16 @@ def _default_llm() -> StepfunClient | None:
                 auth = _json.load(open(auth_path))
                 go_key = (auth.get("opencode-go") or {}).get("key") or ""
                 if go_key:
+                    # OpenCode Zen requires a session id header to route the
+                    # request; without it the gateway returns
+                    # 400 MissingSessionID ("cannot be routed efficiently").
+                    import uuid as _uuid
                     return StepfunClient(
                         api_key=go_key,
                         base_url="https://opencode.ai/zen/go/v1",
                         model="deepseek-v4-flash",
                         timeout=90.0,
+                        extra_headers={"x-opencode-session": _uuid.uuid4().hex},
                     )
             except Exception:
                 pass
@@ -1340,6 +1394,15 @@ async def _ask_hermes_for_experiment(
         proc.kill()
         await proc.wait()
         raise RuntimeError("hermes k8s-expert timed out after 350s")
+    except _asyncio.CancelledError:
+        # We lost the plan-generation race — kill the CLI so it isn't
+        # orphaned, then propagate the cancellation.
+        proc.kill()
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+        raise
     if proc.returncode != 0 and not out_b:
         raise RuntimeError(f"hermes exited rc={proc.returncode}")
 
@@ -1524,6 +1587,36 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
             slave_svc = str(w.get("name", "mysql-slave"))
 
     new_checks = []
+    # Pre-scan: if the plan uses any verify: template, the LLM sometimes ALSO
+    # hand-rolls its own verifier (e.g. a Deployment `mysql-verify` whose
+    # script echoes REPLICATION_VERIFIED=true). That duplicate burns a full
+    # check timeout when the hand-rolled script is wrong, and verifies nothing
+    # the templates don't already cover. Drop LLM pod_log_match checks whose
+    # expected marker is one of our template markers.
+    _uses_templates = any(
+        isinstance(c, dict) and _is_verify_target(str(c.get("target", "")))
+        for c in checks
+    )
+    if _uses_templates:
+        _marker_set = {
+            str(tc.get("expect", ""))
+            for tpl in VERIFY_TEMPLATES.values()
+            for tc in tpl.get("checks", [])
+        }
+        _kept: list = []
+        for c in checks:
+            if (isinstance(c, dict)
+                    and str(c.get("type", "")) == "pod_log_match"
+                    and not _is_verify_target(str(c.get("target", "")))
+                    and str(c.get("expect", "")) in _marker_set):
+                logger.info(
+                    "dropping redundant LLM verifier check %r (marker %r already "
+                    "covered by a verify template)", c.get("name"), c.get("expect"),
+                )
+                continue
+            _kept.append(c)
+        checks = _kept
+
     for c in checks:
         if not isinstance(c, dict):
             new_checks.append(c)
@@ -1546,7 +1639,7 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
             )
             cleaned_workloads.append({
                 "name": wl_name,
-                "kind": "Job",
+                "kind": "Deployment",
                 "image": f"registry.adms.io:31542/library/mysql:8.0.32",
                 "replicas": 1,
                 "yaml": wl_yaml,
@@ -1581,10 +1674,7 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
         if not isinstance(c, dict):
             continue
         target = str(c.get("target", ""))[:200].strip()
-        ref = target.split("/")[-1].lower()
-        if ref.startswith("app="):
-            ref = ref[4:]
-        ref = ref.strip()
+        ref = _normalize_target_ref(target).lower().strip()
         if ref:
             check_targets.add(ref)
 
@@ -1599,7 +1689,7 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
             continue
         # Auto-generate a minimal Deployment + Service for this database type
         auto_image = _resolve_image_for_check(cleaned_workloads, label)
-        wl_name = f"auto-{label}"
+        wl_name = f"auto-{_sanitize_k8s_name(label)}"
         wl_yaml = _make_workload_for_image(wl_name, label, namespace, auto_image)
         auto_generated.append({
             "name": wl_name,
@@ -1632,15 +1722,17 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
             logger.warning("skipping unsupported check type: %s", ctype)
             continue
         target = str(c.get("target", ""))[:200]
+        # Normalize a service_ready target written as "service=name"/"svc=name"
+        # to the bare service name so the check resolves it directly.
+        if ctype == "service_ready":
+            _t = target.strip()
+            for _pfx in ("service=", "svc="):
+                if _t.lower().startswith(_pfx):
+                    target = _t[len(_pfx):].strip()
+                    break
         # Resolve what the check targets: a bare selector (app=x), a
         # resource-qualified name (deployment/x), or a service name.
-        ref = target.strip()
-        # strip kind/ prefix
-        ref_low = ref.split("/")[-1].lower()
-        # label selector form: app=<name>  → name
-        if ref_low.startswith("app="):
-            ref_low = ref_low[len("app="):]
-        ref_low = ref_low.strip()
+        ref_low = _normalize_target_ref(target).lower().strip()
         exists = (
             (ref_low in deployed_names)
             or (ref_low in deployed_apps)
@@ -1649,8 +1741,13 @@ def _validate_plan(plan: dict, namespace: str) -> dict:
         timeout = max(10, int(c.get("timeout_sec") or 90))
         # Cap each check's wait so many checks can't pile up hundreds of
         # seconds of serial timeouts (this was timing out whole researches).
-        # MySQL initialization can take 60-90s, so allow up to 180s per check.
-        timeout = min(timeout, 180)
+        # MySQL first-boot init can take 90-120s, so give readiness checks a
+        # higher ceiling + a floor: pod_ready/service_ready occasionally lost
+        # the race against a slow-to-start database in a shared namespace.
+        if ctype in ("pod_ready", "service_ready"):
+            timeout = min(max(timeout, 180), 240)
+        else:
+            timeout = min(timeout, 180)
         if not exists:
             logger.warning(
                 "skipping check %r: target %r has no matching workload "
@@ -1739,6 +1836,47 @@ async def _apply_workload(kc_path: str, manifest: str) -> tuple[int, str, str]:
         proc.kill()
         await proc.wait()
         return -2, "", "kubectl apply timed out"
+
+
+def _is_namespace_forbidden(err: str) -> bool:
+    """True if a failed namespace create was an RBAC rejection (not e.g. a
+    transient network error). Used to decide whether to fall back to a shared
+    namespace the credential CAN use."""
+    e = (err or "").lower()
+    return ("forbidden" in e and "namespaces" in e) or (
+        "cannot create resource" in e and "namespaces" in e
+    )
+
+
+def _tag_manifest(manifest: str, key: str, value: str) -> str:
+    """Add ``key: value`` to metadata.labels of every doc in a manifest.
+
+    Used for label-based cleanup when experiments run in a shared namespace
+    (the credential has no cluster-scope namespace permission, so we can't
+    delete the whole namespace afterwards)."""
+    try:
+        docs = [d for d in yaml.safe_load_all(manifest) if isinstance(d, dict)]
+    except Exception:
+        return manifest
+    if not docs:
+        return manifest
+    for d in docs:
+        meta = d.setdefault("metadata", {})
+        if isinstance(meta, dict):
+            labels = meta.setdefault("labels", {})
+            if isinstance(labels, dict):
+                labels[key] = value
+    return yaml.safe_dump_all(docs, default_flow_style=False)
+
+
+async def _delete_by_label(kc_path: str, ns: str, key: str, value: str) -> tuple[int, str, str]:
+    """Delete all experiment resources in a shared namespace by label."""
+    kinds = "deployment,statefulset,daemonset,replicaset,service,configmap,job,pod"
+    return await _kubectl_async(
+        ["--kubeconfig", kc_path, "delete", kinds, "-n", ns,
+         "-l", f"{key}={value}", "--ignore-not-found=true", "--wait=false"],
+        timeout=60,
+    )
 
 
 async def _resolve_pod_selector(kc_path: str, ns: str, target: str) -> str:
@@ -1848,10 +1986,28 @@ async def _check_service_ready(kc_path: str, ns: str, service: str, timeout_sec:
         else:
             return {"passed": False, "evidence": f"没有匹配选择器 '{service}' 的 Service"}
     svc = svc.split("/")[-1]
+    # Resolve the Service's selector once. Endpoints objects require RBAC we
+    # may not have (the restricted airw-bot SA cannot `get endpoints`), so we
+    # fall back to checking readiness of pods matching the Service selector.
+    selector = ""
+    rc_s, sel_out, _ = await _kubectl_async(
+        ["--kubeconfig", kc_path, "get", "service", svc, "-n", ns,
+         "-o", "jsonpath={.spec.selector}"],
+        timeout=10,
+    )
+    if rc_s == 0 and sel_out.strip():
+        try:
+            sel = json.loads(sel_out.strip())
+            if isinstance(sel, dict) and sel:
+                selector = ",".join(f"{k}={v}" for k, v in sel.items())
+        except Exception:
+            selector = ""
+
     deadline = asyncio.get_event_loop().time() + timeout_sec
     last_ips = ""
     last_wait_ts = 0.0
     while asyncio.get_event_loop().time() < deadline:
+        # Preferred signal: Endpoints (available with broad RBAC).
         rc, out, err = await _kubectl_async(
             ["--kubeconfig", kc_path, "get", "endpoints", svc, "-n", ns,
              "-o", "jsonpath={.subsets[*].addresses[*].ip}"],
@@ -1864,12 +2020,23 @@ async def _check_service_ready(kc_path: str, ns: str, service: str, timeout_sec:
                 if progress_cb is not None:
                     await progress_cb(f"[service_ready] {svc} endpoints: {ips}")
             return {"passed": True, "evidence": f"Service {svc} 已有端点: {ips}"}
+        # Fallback: a Ready pod matching the Service selector (works when the
+        # credential cannot read Endpoints, e.g. shared-namespace mode).
+        if selector:
+            rc2, out2, _ = await _kubectl_async(
+                ["--kubeconfig", kc_path, "get", "pods", "-n", ns, "-l", selector,
+                 "-o", "jsonpath={.items[*].status.containerStatuses[*].ready}"],
+                timeout=10,
+            )
+            if rc2 == 0 and "true" in out2.lower():
+                return {"passed": True,
+                        "evidence": f"Service {svc} selector [{selector}] 有就绪 Pod"}
         now = asyncio.get_event_loop().time()
         if progress_cb is not None and now - last_wait_ts >= 15:
             last_wait_ts = now
-            await progress_cb(f"[service_ready] {svc} 暂无端点，等待... ({int(deadline - now)}s 剩余)")
+            await progress_cb(f"[service_ready] {svc} 暂无可就绪后端，等待... ({int(deadline - now)}s 剩余)")
         await asyncio.sleep(3)
-    return {"passed": False, "evidence": f"超时 {timeout_sec}s — Service {svc} 无端点"}
+    return {"passed": False, "evidence": f"超时 {timeout_sec}s — Service {svc} 无就绪后端"}
 
 
 async def _check_pod_log_match(kc_path: str, ns: str, target: str, substring: str, timeout_sec: int,
@@ -1952,6 +2119,173 @@ async def _check_http_ok(kc_path: str, ns: str, url: str, expect: str, timeout_s
     return {"passed": False, "evidence": f"HTTP {url} 在 {timeout_sec}s 内不可达（期望 {expect}）"}
 
 
+async def _run_checks_concurrent(
+    kc_path: str,
+    ns: str,
+    plan: dict,
+    failed_workloads: set[str],
+    results: dict,
+) -> AsyncIterator:
+    """Execute all plan checks concurrently (bounded) and stream progress.
+
+    Yields the same AgentEvents the former sequential loop did; appends one
+    result dict per executed check to ``results["checks"]`` in plan order.
+
+    Concurrency matters because checks are independent log/state tailers: with
+    the old sequential loop two 180s timeouts stacked to 360s, whereas now
+    they overlap. A sliding semaphore (MAX_PARALLEL_CHECKS) bounds the number
+    of in-flight kubectl-polling tasks.
+
+    Checks already marked ``_skipped`` during planning are run through the
+    dispatcher (which returns their skip result immediately) so they still
+    appear in the artifact — but are tagged ``_skipped`` so the summary and
+    UI count them as skipped, not failed.
+    """
+    checks = plan.get("checks") or []
+    auto_labels = set(plan.get("_auto_labels") or [])
+
+    def _ref(c: dict) -> str:
+        return _normalize_target_ref(c.get("target", "")).lower().strip()
+
+    # Pass 1 — evaluate skip conditions (cheap, no I/O).
+    runnable: list[tuple[int, dict]] = []
+    for ci, c in enumerate(checks):
+        ref = _ref(c)
+        if (ref in failed_workloads
+                or (ref and any(ref in fw for fw in failed_workloads))
+                ) and not c.get("_skipped"):
+            c["_skipped"] = True
+            c["evidence"] = f"目标工作负载 {c['target']} 应用失败，断言跳过"
+            yield AgentEvent(phase="validate", level="warn",
+                             title=f"断言跳过: {c['name']}", detail=c["evidence"],
+                             task_id="task-10", task_progress=min(80, 45 + ci * 3))
+            continue
+        if (c.get("type") == "pod_log_match" and ref in auto_labels
+                and not c.get("_skipped")):
+            c["_skipped"] = True
+            c["evidence"] = (f"目标工作负载 {ref} 由系统自动补齐（通用服务器），"
+                             f"无法保证输出期望标记 '{c.get('expect','')[:40]}'，断言跳过")
+            yield AgentEvent(phase="validate", level="warn",
+                             title=f"断言跳过: {c['name']}", detail=c["evidence"],
+                             task_id="task-10", task_progress=min(80, 45 + ci * 3))
+            continue
+        runnable.append((ci, c))
+
+    if not runnable:
+        return
+
+    sem = asyncio.Semaphore(MAX_PARALLEL_CHECKS)
+    metas: list[dict] = []
+
+    for ci, c in runnable:
+        q: "asyncio.Queue[str]" = asyncio.Queue()
+        meta: dict = {"ci": ci, "c": c, "q": q, "task": None,
+                      "start": None,
+                      "timeout": max(30, int(c.get("timeout_sec", 90)) + 15),
+                      "result": None}
+
+        async def _runner(c=c, q=q, meta=meta):
+            # Deadline starts only once the task actually begins (after the
+            # semaphore is acquired), so queued checks aren't falsely timed out.
+            async with sem:
+                meta["start"] = asyncio.get_event_loop().time()
+                if c.get("_skipped"):
+                    return {"passed": False, "evidence": c.get("evidence", "跳过"),
+                            "_skipped": True}
+
+                async def _progress(msg: str, q=q) -> None:
+                    q.put_nowait(msg)
+
+                if c["type"] == "pod_ready":
+                    return await _check_pod_ready(kc_path, ns, c["target"], c["timeout_sec"], progress_cb=_progress)
+                if c["type"] == "service_ready":
+                    return await _check_service_ready(kc_path, ns, c["target"], c["timeout_sec"], progress_cb=_progress)
+                if c["type"] == "pod_log_match":
+                    return await _check_pod_log_match(kc_path, ns, c["target"], c["expect"], c["timeout_sec"], progress_cb=_progress)
+                if c["type"] == "http_ok":
+                    return await _check_http_ok(kc_path, ns, c["target"], c["expect"], c["timeout_sec"])
+                return {"passed": False, "evidence": "unsupported check"}
+
+        meta["task"] = asyncio.create_task(_runner())
+        metas.append(meta)
+        yield AgentEvent(phase="validate", level="info", title=f"断言: {c['name']}",
+                         detail=f"{c['type']} · {c['target']} · expect={c['expect']} · 超时 {c['timeout_sec']}s",
+                         task_id="task-10", task_progress=min(80, 45 + ci * 3))
+
+    # Pass 2 — poll all in-flight checks until every one has a result.
+    while any(m["result"] is None for m in metas):
+        now = asyncio.get_event_loop().time()
+        for m in metas:
+            if m["result"] is not None:
+                continue
+            c = m["c"]
+            # Outer safety deadline (guards against a stuck kubectl); only
+            # applies once the task has actually started running.
+            if m["start"] is not None and now - m["start"] > m["timeout"]:
+                m["task"].cancel()
+                try:
+                    await m["task"]
+                except (asyncio.CancelledError, Exception):
+                    pass
+                logger.warning("check %s exceeded outer timeout %ss; forced end",
+                               c["name"], m["timeout"])
+                m["result"] = {"passed": False,
+                               "evidence": f"检查超过外层超时 {m['timeout']}s，已强制结束"}
+                continue
+            # Drain this check's progress queue.
+            while True:
+                try:
+                    msg = m["q"].get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                yield AgentEvent(phase="validate", level="log",
+                                 title=f"断言监控: {c['name']}", detail=msg, task_id="task-10")
+            if m["task"].done():
+                try:
+                    m["result"] = m["task"].result()
+                except asyncio.CancelledError:
+                    m["result"] = {"passed": False, "evidence": "检查已取消"}
+                except Exception as e:
+                    logger.warning("check task %s raised: %s", c["name"], e)
+                    m["result"] = {"passed": False,
+                                   "evidence": f"检查执行异常: {type(e).__name__}: {str(e)[:150]}"}
+        if all(m["result"] is not None for m in metas):
+            break
+        # Wake immediately when any check finishes; the 1s timeout keeps
+        # progress draining and outer-deadline checks ticking.
+        inflight = {m["task"] for m in metas
+                    if m["result"] is None and not m["task"].done()}
+        if inflight:
+            await asyncio.wait(inflight, timeout=1.0,
+                               return_when=asyncio.FIRST_COMPLETED)
+        else:
+            await asyncio.sleep(0.1)
+
+    # Emit results in plan order (stable output regardless of finish order).
+    for m in sorted(metas, key=lambda x: x["ci"]):
+        c = m["c"]
+        while True:
+            try:
+                msg = m["q"].get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            yield AgentEvent(phase="validate", level="log",
+                             title=f"断言监控: {c['name']}", detail=msg, task_id="task-10")
+        res = m["result"] or {"passed": False, "evidence": "unknown"}
+        results["checks"].append({
+            "name": c["name"], "type": c["type"], "target": c["target"],
+            "expect": c["expect"], **res,
+        })
+        is_skip = bool(res.get("_skipped"))
+        yield AgentEvent(
+            phase="validate",
+            level="warn" if (is_skip or not res["passed"]) else "success",
+            title=(f"断言跳过: {c['name']}" if is_skip
+                   else f"断言 {'通过' if res['passed'] else '失败'}: {c['name']}"),
+            detail=res["evidence"], task_id="task-10",
+        )
+
+
 async def run_experiment(
     research_id: str,
     goal: str,
@@ -1979,27 +2313,81 @@ async def run_experiment(
     yield AgentEvent(phase="validate", level="info", title="创建试验命名空间",
                      detail=ns, task_id="task-10", task_progress=20)
 
-    # 2. LLM generates the plan (hermes k8s-expert primary, Stepfun fallback)
-    try:
-        raw_plan = await _ask_hermes_for_experiment(ns, goal, recommendations_md)
-        plan = _validate_plan(raw_plan, ns)
-        if not plan["workloads"] or not plan["checks"]:
+    # Create the isolated per-research namespace up front. If the configured
+    # credential is namespace-scoped (cannot create namespaces at cluster
+    # scope — e.g. the restricted airw-bot SA, which deliberately has no
+    # cluster RBAC), fall back to that credential's own namespace and clean
+    # up by label instead of deleting a namespace.
+    _shared_ns = False
+    _ns_rc, _ns_out, _ns_err = create_namespace(kc_path, ns)
+    if _ns_rc != 0:
+        _fb_ns = kc_meta.get("namespace") or DEFAULT_NAMESPACE
+        if _is_namespace_forbidden(_ns_err) and _fb_ns:
+            _shared_ns = True
+            ns = _fb_ns
+            _assert_safe_namespace(ns)
+            yield AgentEvent(phase="validate", level="warn",
+                             title="命名空间创建被拒绝，改用共享命名空间",
+                             detail=f"{ns}（凭据无集群级 namespace 权限；试验结束按标签清理）",
+                             task_id="task-10", task_progress=22)
+        else:
+            yield AgentEvent(phase="validate", level="error", title="命名空间创建失败",
+                             detail=_ns_err[:200], task_id="task-10", task_progress=100)
+            return
+
+    # 2. LLM generates the plan. hermes k8s-expert and the direct-LLM fallback
+    #    are RACED concurrently: hermes frequently stalls for its full 350s
+    #    timeout before failing, and waiting for it serially doubled plan
+    #    latency (observed 350s + fallback). Whichever returns a valid plan
+    #    first wins; the slower task is cancelled.
+    llm = _default_llm()
+
+    async def _plan_via_hermes():
+        raw = await _ask_hermes_for_experiment(ns, goal, recommendations_md)
+        p = _validate_plan(raw, ns)
+        if not p["workloads"] or not p["checks"]:
             raise RuntimeError("hermes returned empty plan")
-    except Exception as he:
-        logger.warning("hermes experiment plan failed (%s); trying Stepfun fallback", he)
-        llm = _default_llm()
+        return p
+
+    async def _plan_via_llm():
         if llm is None:
-            yield AgentEvent(phase="validate", level="error", title="试验计划失败",
-                             detail=f"hermes: {str(he)[:120]}; 未配置 Stepfun API key 作备选",
-                             task_id="task-10", task_progress=100)
-            return
-        try:
-            raw_plan = await _ask_llm_for_experiment(llm, ns, goal, recommendations_md)
-            plan = _validate_plan(raw_plan, ns)
-        except Exception as e:
-            yield AgentEvent(phase="validate", level="error", title="AI 生成试验计划失败",
-                             detail=f"{type(e).__name__}: {str(e)[:200]}", task_id="task-10", task_progress=100)
-            return
+            raise RuntimeError("no fallback LLM configured")
+        raw = await _ask_llm_for_experiment(llm, ns, goal, recommendations_md)
+        p = _validate_plan(raw, ns)
+        if not p["workloads"] or not p["checks"]:
+            raise RuntimeError("fallback returned empty plan")
+        return p
+
+    plan = None
+    plan_errors: list[str] = []
+    tasks = {"hermes": asyncio.create_task(_plan_via_hermes(), name="plan-hermes")}
+    if llm is not None:
+        tasks["llm"] = asyncio.create_task(_plan_via_llm(), name="plan-llm")
+    pending = set(tasks.values())
+    while pending and plan is None:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for t in done:
+            try:
+                plan = t.result()
+                logger.info("experiment plan generated via %s", t.get_name())
+                break
+            except Exception as e:
+                plan_errors.append(f"{t.get_name()}: {str(e)[:140]}")
+    # Cancel whichever producer lost the race (best-effort).
+    for t in tasks.values():
+        if not t.done():
+            t.cancel()
+    for t in tasks.values():
+        if t.cancelled() or not t.done():
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+    if plan is None:
+        yield AgentEvent(phase="validate", level="error", title="AI 生成试验计划失败",
+                         detail="; ".join(plan_errors)[:300] or "no plan",
+                         task_id="task-10", task_progress=100)
+        return
 
     yield AgentEvent(
         phase="validate", level="info",
@@ -2008,13 +2396,7 @@ async def run_experiment(
         task_id="task-10", task_progress=25,
     )
 
-    # 3. Create namespace + apply
-    rc, out, err = create_namespace(kc_path, ns)
-    if rc != 0:
-        yield AgentEvent(phase="validate", level="error", title="命名空间创建失败",
-                         detail=err[:200], task_id="task-10", task_progress=100)
-        return
-
+    # 3. Apply workloads (namespace already created/selected above).
     results = {"applied": [], "checks": []}
     # Track workloads that failed to apply — checks targeting them are
     # auto-skipped to avoid hanging on pod_log_match for non-existent pods.
@@ -2023,6 +2405,9 @@ async def run_experiment(
         for i, w in enumerate(plan["workloads"]):
             # Validate and auto-fix common LLM YAML issues before applying
             w = _validate_and_fix_workload_yaml(w)
+            # In a shared namespace, tag everything so cleanup can target it.
+            if _shared_ns:
+                w["yaml"] = _tag_manifest(w["yaml"], "airw-exp", research_id[:8])
 
             yield AgentEvent(phase="validate", level="info",
                              title=f"应用工作负载 {i+1}/{len(plan['workloads'])}: {w['name']}",
@@ -2104,122 +2489,14 @@ async def run_experiment(
                                  title=f"应用 {w['name']} 失败", detail=error_msg,
                                  task_id="task-10")
 
-        # 4. Run checks — each check runs as a background task that streams
-        #    live progress through a queue, so the console shows the pod's
-        #    state / endpoints / log tail in near-real-time while waiting.
-        for ci, c in enumerate(plan["checks"]):
-            # Auto-skip checks whose target workload failed to apply —
-            # avoids hanging on pod_log_match for non-existent pods.
-            # Normalize: strip "app=" prefix and kind/ prefix to get the
-            # bare label/name for comparison with _failed_workloads.
-            _target_ref = c["target"].split("/")[-1].lower().strip()
-            if _target_ref.startswith("app="):
-                _target_ref = _target_ref[4:]
-            _target_ref = _target_ref.strip()
-            if (_target_ref in _failed_workloads
-                or (_target_ref and any(_target_ref in fw for fw in _failed_workloads))
-                ) and not c.get("_skipped"):
-                c["_skipped"] = True
-                c["evidence"] = f"目标工作负载 {c['target']} 应用失败，断言跳过"
-                yield AgentEvent(phase="validate", level="warn",
-                                 title=f"断言跳过: {c['name']}",
-                                 detail=c["evidence"], task_id="task-10",
-                                 task_progress=min(80, 45 + ci * 3))
-                continue
-
-            # pod_log_match checks on auto-generated workloads: we cannot
-            # guarantee the LLM intended marker strings will appear in a
-            # generic server's logs.  Skip immediately instead of burning
-            # the full timeout for nothing.
-            _auto_labels = set(plan.get("_auto_labels") or [])
-            if c.get("type") == "pod_log_match" and _target_ref in _auto_labels and not c.get("_skipped"):
-                c["_skipped"] = True
-                c["evidence"] = (f"目标工作负载 {_target_ref} 由系统自动补齐（通用服务器），"
-                                 f"无法保证输出期望标记 '{c.get('expect','')[:40]}'，断言跳过")
-                yield AgentEvent(phase="validate", level="warn",
-                                 title=f"断言跳过: {c['name']}",
-                                 detail=c["evidence"], task_id="task-10",
-                                 task_progress=min(80, 45 + ci * 3))
-                continue
-
-            yield AgentEvent(phase="validate", level="info",
-                             title=f"断言: {c['name']}",
-                             detail=f"{c['type']} · {c['target']} · expect={c['expect']} · 超时 {c['timeout_sec']}s",
-                             task_id="task-10",
-                             task_progress=min(80, 45 + ci * 3))
-
-            q: "asyncio.Queue[str]" = asyncio.Queue()
-
-            async def _progress(msg: str) -> None:
-                q.put_nowait(msg)
-
-            async def _run():
-                if c.get("_skipped"):
-                    return {"passed": False, "evidence": c.get("evidence", "跳过")}
-                if c["type"] == "pod_ready":
-                    return await _check_pod_ready(kc_path, ns, c["target"], c["timeout_sec"], progress_cb=_progress)
-                elif c["type"] == "service_ready":
-                    return await _check_service_ready(kc_path, ns, c["target"], c["timeout_sec"], progress_cb=_progress)
-                elif c["type"] == "pod_log_match":
-                    return await _check_pod_log_match(kc_path, ns, c["target"], c["expect"], c["timeout_sec"], progress_cb=_progress)
-                elif c["type"] == "http_ok":
-                    return await _check_http_ok(kc_path, ns, c["target"], c["expect"], c["timeout_sec"])
-                return {"passed": False, "evidence": "unsupported check"}
-
-            task = asyncio.create_task(_run())
-            # Hard outer deadline: even if the check task itself never
-            # finishes (e.g. a stuck kubectl / broken event-loop time), we
-            # must not let the whole research hang. Each check has its own
-            # timeout_sec; we add +15s headroom then force-cancel the task.
-            check_start = asyncio.get_event_loop().time()
-            check_timeout = max(30, c.get("timeout_sec", 90) + 15)
-            res = None
-            while not task.done():
-                if asyncio.get_event_loop().time() - check_start > check_timeout:
-                    # Force-terminate a stuck check so the experiment proceeds.
-                    task.cancel()
-                    try:
-                        await task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    logger.warning("check %s exceeded outer timeout %ss; forced end", c["name"], check_timeout)
-                    res = {"passed": False, "evidence": f"检查超过外层超时 {check_timeout}s，已强制结束"}
-                    break
-                try:
-                    msg = q.get_nowait()
-                    yield AgentEvent(phase="validate", level="log",
-                                     title=f"断言监控: {c['name']}",
-                                     detail=msg, task_id="task-10")
-                except asyncio.QueueEmpty:
-                    pass
-                # NOTE: do NOT use asyncio.wait_for(task, timeout) here — it
-                # would CANCEL the running check task on timeout. Just sleep
-                # and re-check task.done().
-                await asyncio.sleep(2)
-            if res is None:
-                try:
-                    res = task.result()
-                except Exception as e:
-                    # A single check crashing must not abort the whole experiment.
-                    # Record it as a failed check and keep going (cleanup still
-                    # runs in the outer finally).
-                    logger.warning("check task %s raised: %s", c["name"], e)
-                    res = {"passed": False, "evidence": f"检查执行异常: {type(e).__name__}: {str(e)[:150]}"}
-            while not q.empty():
-                msg = q.get_nowait()
-                yield AgentEvent(phase="validate", level="log",
-                                 title=f"断言监控: {c['name']}",
-                                 detail=msg, task_id="task-10")
-            results["checks"].append({
-                "name": c["name"], "type": c["type"], "target": c["target"],
-                "expect": c["expect"], **res,
-            })
-            yield AgentEvent(
-                phase="validate",
-                level="success" if res["passed"] else "warn",
-                title=f"断言 {'通过' if res['passed'] else '失败'}: {c['name']}",
-                detail=res["evidence"], task_id="task-10",
-            )
+        # 4. Run checks CONCURRENTLY (bounded). Each check is an independent
+        #    task that tails pod state/logs, so a slow or failing check no
+        #    longer serializes the others — two 180s timeouts now overlap
+        #    instead of stacking to 360s. Progress is streamed per check.
+        async for _ev in _run_checks_concurrent(
+            kc_path, ns, plan, _failed_workloads, results,
+        ):
+            yield _ev
 
         passed = sum(1 for c in results["checks"] if c.get("passed"))
         skipped = sum(1 for c in results["checks"] if c.get("_skipped"))
@@ -2286,10 +2563,21 @@ async def run_experiment(
                                    "title": f"K8s 试验: {plan['experiment']['name']}",
                                    "content": json.dumps(artifact, ensure_ascii=False, indent=2)})
     finally:
-        # 6. Cleanup: always delete the experiment namespace (idempotent).
-        rc, out, err = delete_namespace(kc_path, ns)
-        yield AgentEvent(phase="validate", level="info", title="试验命名空间已清理",
-                         detail=ns, task_id="task-10", task_progress=100)
+        # 6. Cleanup. In an isolated namespace, delete the namespace. In a
+        #    shared namespace (namespace-scoped credential), delete only the
+        #    resources we labelled, leaving pre-existing content intact.
+        if _shared_ns:
+            rc, out, err = await _delete_by_label(
+                kc_path, ns, "airw-exp", research_id[:8],
+            )
+            yield AgentEvent(phase="validate", level="info",
+                             title="试验资源已清理（共享命名空间）",
+                             detail=f"{ns} · label airw-exp={research_id[:8]} "
+                                    f"(rc={rc})", task_id="task-10", task_progress=100)
+        else:
+            rc, out, err = delete_namespace(kc_path, ns)
+            yield AgentEvent(phase="validate", level="info", title="试验命名空间已清理",
+                             detail=ns, task_id="task-10", task_progress=100)
         if kc_meta["source"] == "db":
             try:
                 os.unlink(kc_path)
