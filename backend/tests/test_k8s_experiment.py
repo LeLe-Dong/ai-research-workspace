@@ -15,15 +15,23 @@ fixes for the failure modes observed in production runs:
   5. Verification templates must be one-shot Jobs (logs persist, no restart)
      rather than Deployments with restartPolicy=Always (logs wiped on restart).
 """
+import asyncio
+import time
+
 import yaml
 import pytest
 
+from app.agents import k8s_experiment as ke
 from app.agents.k8s_experiment import (
     VERIFY_TEMPLATES,
     _auto_ensure_services,
+    _is_namespace_forbidden,
     _make_workload_from_template,
+    _run_checks_concurrent,
     _sync_service_selectors,
+    _tag_manifest,
     _validate_and_fix_workload_yaml,
+    _validate_plan,
 )
 
 NS = "airw-research-experiments-test1234"
@@ -68,19 +76,20 @@ def _workload(name: str, kind: str, doc: dict) -> dict:
 
 # ───────────── verify templates are one-shot Jobs ─────────────
 
-def test_all_verify_templates_generate_jobs():
+def test_all_verify_templates_generate_deployments():
+    # Deployments (not Jobs): the restricted shared-namespace credential has
+    # no RBAC for batch/v1 Jobs. The wrapper keeps the container alive
+    # (sleep) so logs persist and side effects run exactly once.
     for key in VERIFY_TEMPLATES:
         name = f"verify-{key.replace('_', '-')}"
         y = _make_workload_from_template(key, name, name, NS, "mysql-master", "mysql-slave")
         doc = yaml.safe_load(y)
-        assert doc["kind"] == "Job", f"{key}: expected Job, got {doc['kind']}"
+        assert doc["kind"] == "Deployment", f"{key}: expected Deployment, got {doc['kind']}"
         spec = doc["spec"]
-        assert spec["backoffLimit"] == 0, f"{key}: backoffLimit must be 0"
-        assert "activeDeadlineSeconds" in spec, f"{key}: missing activeDeadlineSeconds"
-        assert spec["template"]["spec"]["restartPolicy"] == "Never", (
-            f"{key}: Job pod must use restartPolicy=Never (Deployment=Always wipes logs)"
-        )
-        # Pods must carry the app label so pod_log_match can select them.
+        assert spec["template"]["spec"]["restartPolicy"] == "Always"
+        args = spec["template"]["spec"]["containers"][0]["args"][0]
+        assert "sleep 3600" in args, f"{key}: script must not exit (keep-alive)"
+        assert "exec sleep" in args
         assert doc["spec"]["template"]["metadata"]["labels"]["app"] == name
 
 
@@ -187,3 +196,205 @@ def test_auto_ensure_services_no_duplicate_when_bundled():
     workloads = [{"name": "mysql-master", "kind": "Deployment", "image": "", "replicas": 1, "yaml": bundled}]
     added = _auto_ensure_services(workloads, NS)
     assert added == [], "must not duplicate a Service already present in the bundle"
+
+
+# ───────────── redundant LLM verifier dedup ─────────────
+
+def test_validate_plan_drops_redundant_llm_verifier_when_templates_used():
+    master = _mysql_deployment("mysql-master")
+    slave = _mysql_deployment("mysql-slave")
+    plan = {
+        "experiment": {"name": "x"},
+        "workloads": [
+            _workload("mysql-master", "Deployment", master),
+            _workload("mysql-slave", "Deployment", slave),
+        ],
+        "checks": [
+            # LLM hand-rolled verifier echoing a marker our template produces.
+            {"name": "dup-verifier", "type": "pod_log_match",
+             "target": "app=mysql-verify", "expect": "REPLICATION_VERIFIED=true",
+             "timeout_sec": 180},
+            # A genuine template reference (kept + expanded).
+            {"name": "tmpl", "type": "pod_log_match",
+             "target": "verify:mysql_write_verify",
+             "expect": "REPLICATION_VERIFIED=true", "timeout_sec": 180},
+        ],
+    }
+    out = _validate_plan(plan, NS)
+    names = [c["name"] for c in out["checks"]]
+    assert "dup-verifier" not in names, "redundant LLM verifier must be dropped"
+    assert any(c["target"].startswith("app=verify-") for c in out["checks"]), (
+        "template must still expand into a generated verifier target"
+    )
+
+
+def test_validate_plan_keeps_llm_verifier_when_no_templates():
+    plan = {
+        "experiment": {"name": "x"},
+        "workloads": [_workload("mysql-master", "Deployment", _mysql_deployment("mysql-master"))],
+        "checks": [
+            {"name": "dup-verifier", "type": "pod_log_match",
+             "target": "app=mysql-master", "expect": "REPLICATION_VERIFIED=true",
+             "timeout_sec": 60},
+        ],
+    }
+    out = _validate_plan(plan, NS)
+    # No verify: template used → we must NOT drop the LLM's own check.
+    assert any(c["name"] == "dup-verifier" for c in out["checks"])
+
+
+# ───────────── concurrent check runner ─────────────
+
+def _drain(coro):
+    async def _go():
+        async for _ in coro:
+            pass
+    asyncio.run(_go())
+
+
+def test_run_checks_concurrent_runs_in_parallel(monkeypatch):
+    calls = []
+
+    async def fake(kc, ns, target, expect, timeout, progress_cb=None):
+        calls.append(target)
+        await asyncio.sleep(0.4)
+        return {"passed": True, "evidence": f"ok:{target}"}
+
+    monkeypatch.setattr(ke, "_check_pod_log_match", fake)
+    plan = {"_auto_labels": [], "checks": [
+        {"name": f"c{i}", "type": "pod_log_match", "target": f"app=a{i}",
+         "expect": "X", "timeout_sec": 10} for i in range(4)
+    ]}
+    results = {"checks": []}
+    t0 = time.monotonic()
+    _drain(_run_checks_concurrent("/k", NS, plan, set(), results))
+    dt = time.monotonic() - t0
+    # 4 × 0.4s serial == 1.6s; concurrent ≈ 0.4s.
+    assert dt < 1.0, f"checks ran serially ({dt:.2f}s), expected parallel"
+    assert len(results["checks"]) == 4
+    # Results preserved in plan order despite finishing concurrently.
+    assert [c["name"] for c in results["checks"]] == ["c0", "c1", "c2", "c3"]
+
+
+def test_run_checks_concurrent_skips_failed_targets(monkeypatch):
+    async def fake(kc, ns, target, expect, timeout, progress_cb=None):
+        return {"passed": True, "evidence": "ok"}
+
+    monkeypatch.setattr(ke, "_check_pod_log_match", fake)
+    plan = {"_auto_labels": [], "checks": [
+        {"name": "c1", "type": "pod_log_match", "target": "app=x",
+         "expect": "X", "timeout_sec": 10},
+    ]}
+    results = {"checks": []}
+    _drain(_run_checks_concurrent("/k", NS, plan, {"x"}, results))
+    assert results["checks"] == [], "check on failed workload must be skipped, not run"
+
+
+def test_run_checks_concurrent_preserves_plan_level_skip(monkeypatch):
+    async def fake(*a, **kw):  # must never be called for a pre-skipped check
+        raise AssertionError("pre-skipped check should not hit the cluster")
+
+    monkeypatch.setattr(ke, "_check_pod_log_match", fake)
+    plan = {"_auto_labels": [], "checks": [
+        {"name": "c1", "type": "pod_log_match", "target": "app=x", "expect": "X",
+         "timeout_sec": 10, "_skipped": True, "evidence": "计划中未部署该资源，跳过"},
+    ]}
+    results = {"checks": []}
+    _drain(_run_checks_concurrent("/k", NS, plan, set(), results))
+    assert len(results["checks"]) == 1
+    assert results["checks"][0]["_skipped"] is True
+    assert results["checks"][0]["passed"] is False
+
+
+def test_run_checks_concurrent_isolates_exceptions(monkeypatch):
+    async def fake(kc, ns, target, expect, timeout, progress_cb=None):
+        if target == "app=boom":
+            raise RuntimeError("kubectl exploded")
+        return {"passed": True, "evidence": "ok"}
+
+    monkeypatch.setattr(ke, "_check_pod_log_match", fake)
+    plan = {"_auto_labels": [], "checks": [
+        {"name": "boom", "type": "pod_log_match", "target": "app=boom", "expect": "X", "timeout_sec": 10},
+        {"name": "fine", "type": "pod_log_match", "target": "app=fine", "expect": "X", "timeout_sec": 10},
+    ]}
+    results = {"checks": []}
+    _drain(_run_checks_concurrent("/k", NS, plan, set(), results))
+    by_name = {c["name"]: c for c in results["checks"]}
+    assert by_name["boom"]["passed"] is False
+    assert "异常" in by_name["boom"]["evidence"]
+    assert by_name["fine"]["passed"] is True
+
+
+# ───────────── shared-namespace fallback (restricted RBAC) ─────────────
+
+def test_is_namespace_forbidden_detects_rbac_rejection():
+    msg = ('Error from server (Forbidden): namespaces is forbidden: User '
+           '"system:serviceaccount:airw-research:airw-bot" cannot create '
+           'resource "namespaces" in API group "" at the cluster scope')
+    assert _is_namespace_forbidden(msg)
+
+
+def test_is_namespace_forbidden_ignores_transient_errors():
+    assert not _is_namespace_forbidden("dial tcp 10.6.6.246:6443: i/o timeout")
+    assert not _is_namespace_forbidden("")
+
+
+def test_tag_manifest_labels_every_document():
+    dep = _mysql_deployment("mysql-master")
+    svc = {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": "mysql-master"},
+        "spec": {"selector": {"app": "mysql-master"}, "ports": [{"port": 3306}]},
+    }
+    manifest = yaml.safe_dump(dep) + "\n---\n" + yaml.safe_dump(svc)
+    tagged = _tag_manifest(manifest, "airw-exp", "abc12345")
+    docs = [d for d in yaml.safe_load_all(tagged) if isinstance(d, dict)]
+    assert len(docs) == 2
+    assert all(d["metadata"]["labels"]["airw-exp"] == "abc12345" for d in docs)
+
+
+def test_tag_manifest_preserves_existing_labels():
+    dep = _mysql_deployment("mysql-master")  # already has app=mysql-master
+    tagged = _tag_manifest(yaml.safe_dump(dep), "airw-exp", "deadbeef")
+    labels = yaml.safe_load(tagged)["metadata"]["labels"]
+    assert labels["app"] == "mysql-master"
+    assert labels["airw-exp"] == "deadbeef"
+
+
+# ───────────── target-ref normalization (bogus auto-workload names) ─────────
+
+def test_normalize_target_ref_strips_known_keys():
+    from app.agents.k8s_experiment import _normalize_target_ref
+    assert _normalize_target_ref("service=mysql-master") == "mysql-master"
+    assert _normalize_target_ref("svc=mysql-slave") == "mysql-slave"
+    assert _normalize_target_ref("app=redis") == "redis"
+    assert _normalize_target_ref("deployment/redis") == "redis"
+    assert _normalize_target_ref("redis") == "redis"
+
+
+def test_sanitize_k8s_name_coerces_invalid_chars():
+    from app.agents.k8s_experiment import _sanitize_k8s_name
+    assert _sanitize_k8s_name("service=mysql-master") == "service-mysql-master"
+    assert _sanitize_k8s_name("Foo_Bar") == "foo-bar"
+    assert _sanitize_k8s_name("") == "wl"
+
+
+def test_validate_plan_no_bogus_auto_workload_for_service_targets():
+    plan = {
+        "experiment": {"name": "x"},
+        "workloads": [
+            _workload("mysql-master", "Deployment", _mysql_deployment("mysql-master")),
+        ],
+        "checks": [
+            # service_ready written with a "service=" prefix must resolve to the
+            # existing deployment, NOT spawn an invalid auto-service=... workload.
+            {"name": "svc", "type": "service_ready", "target": "service=mysql-master",
+             "expect": "true", "timeout_sec": 60},
+        ],
+    }
+    out = _validate_plan(plan, NS)
+    names = [w["name"] for w in out["workloads"]]
+    assert not any("=" in n for n in names), f"invalid workload names: {names}"
+    assert not any(w.get("name", "").startswith("auto-service") for w in out["workloads"])
+    assert out["checks"][0]["target"] == "mysql-master"
