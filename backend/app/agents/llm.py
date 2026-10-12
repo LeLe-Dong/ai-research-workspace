@@ -256,39 +256,27 @@ class StepfunClient:
         if cleaned and cleaned != text.strip():
             candidates.append(cleaned)
 
-        # 3. Find first '{' and matching balanced '}'
-        first = text.find("{")
-        if first >= 0:
+        # 3. Collect every balanced {...} object and try the LARGEST first —
+        # reasoning models emit schema fragments/prose before the real answer,
+        # and the actual answer is the biggest object. (The old code returned
+        # the FIRST balanced object, which was often a tiny schema fragment.)
+        balanced: list[str] = []
+        for j, ch in enumerate(text):
+            if ch != "{":
+                continue
             depth = 0
-            last = -1
-            for i in range(first, len(text)):
-                if text[i] == "{":
+            for k in range(j, len(text)):
+                if text[k] == "{":
                     depth += 1
-                elif text[i] == "}":
+                elif text[k] == "}":
                     depth -= 1
                     if depth == 0:
-                        last = i
+                        if k > j:
+                            balanced.append(text[j:k + 1].strip())
                         break
-            if last > first:
-                candidates.append(text[first:last + 1].strip())
-
-        # 4. Try each { ... } group in the text (handles thinking + JSON mixed)
-        for j in range(len(text)):
-            if text[j] == "{":
-                depth = 0
-                end = -1
-                for k in range(j, len(text)):
-                    if text[k] == "{":
-                        depth += 1
-                    elif text[k] == "}":
-                        depth -= 1
-                        if depth == 0:
-                            end = k
-                            break
-                if end > j:
-                    cand = text[j:end + 1].strip()
-                    if cand not in candidates and len(cand) > 50:  # skip tiny {}
-                        candidates.append(cand)
+        for cand in sorted(set(balanced), key=len, reverse=True):
+            if len(cand) > 2:
+                candidates.append(cand)
 
         last_err = None
         for c in candidates:
