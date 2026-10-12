@@ -77,11 +77,13 @@ class StepfunClient:
         base_url: str = DEFAULT_BASE_URL,
         model: str = DEFAULT_MODEL,
         timeout: float = 180.0,
+        extra_headers: dict | None = None,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
+        self.extra_headers = dict(extra_headers or {})
 
     async def chat(
         self,
@@ -107,6 +109,7 @@ class StepfunClient:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
+            **self.extra_headers,
         }
         body = {
             "model": self.model,
@@ -161,7 +164,8 @@ class StepfunClient:
         if not self.api_key:
             raise LLMError("API key not set")
         url = f"{self.base_url}/chat/completions"
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json",
+                   **self.extra_headers}
         body = {
             "model": self.model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
