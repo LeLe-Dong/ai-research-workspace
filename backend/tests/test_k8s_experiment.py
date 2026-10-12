@@ -398,3 +398,14 @@ def test_validate_plan_no_bogus_auto_workload_for_service_targets():
     assert not any("=" in n for n in names), f"invalid workload names: {names}"
     assert not any(w.get("name", "").startswith("auto-service") for w in out["workloads"])
     assert out["checks"][0]["target"] == "mysql-master"
+
+
+def test_all_verify_template_scripts_parse_with_sh():
+    """The keep-alive wrapper must not produce shell syntax errors (e.g. a
+    stray ';;' from a template ending in 'fi;'), which crash-loops the pod."""
+    import subprocess
+    for key in VERIFY_TEMPLATES:
+        y = _make_workload_from_template(key, f"v-{key}", "v", NS, "m", "s")
+        args = yaml.safe_load(y)["spec"]["template"]["spec"]["containers"][0]["args"][0]
+        p = subprocess.run(["sh", "-n"], input=args, capture_output=True, text=True)
+        assert p.returncode == 0, f"{key}: shell syntax error: {p.stderr[:120]}"
