@@ -846,11 +846,10 @@ def _make_mysql_verify_workload(name: str, app_label: str, namespace: str,
     """
     # Never let the shell exit: guarantees restartPolicy=Always never
     # restarts the container (which would wipe logs / re-run side effects).
-    wrapped = (
-        "set +e; "
-        + script
-        + "; echo VERIFY_SCRIPT_DONE; exec sleep 3600"
-    )
+    # Strip a trailing ';' from the template so we don't emit ';;'
+    # (e.g. scripts ending in 'fi;' -> 'fi;   echo ...').
+    base = script.rstrip().rstrip(";").rstrip()
+    wrapped = "set +e; " + base + "; echo VERIFY_SCRIPT_DONE; exec sleep 3600"
     dep = {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -1164,7 +1163,7 @@ def _default_llm() -> StepfunClient | None:
                         api_key=go_key,
                         base_url="https://opencode.ai/zen/go/v1",
                         model="deepseek-v4-flash",
-                        timeout=90.0,
+                        timeout=180.0,
                         extra_headers={"x-opencode-session": _uuid.uuid4().hex},
                     )
             except Exception:
@@ -1271,17 +1270,44 @@ async def _ask_llm_for_experiment(
     goal: str,
     recommendations_md: str,
 ) -> dict:
+    import asyncio as _asyncio
     user = (
         "研究目标：\n" + (goal or "") + "\n\n"
         "研究发现/推荐方案：\n" + (recommendations_md or "")[:6000] + "\n\n"
         "请根据以上研究设计一个真实的 Kubernetes 验证试验，生成 JSON。"
     )
-    try:
-        return await llm.chat_json(EXPERIMENT_SYSTEM.format(namespace=namespace), user,
-                                   max_tokens=6000, temperature=0.2)
-    except (LLMError, Exception) as e:
-        logger.warning("LLM experiment planning failed: %s", e)
-        raise
+    system = EXPERIMENT_SYSTEM.format(namespace=namespace)
+    last_err: Exception | None = None
+    # Up to 3 attempts: the model occasionally emits malformed JSON or an
+    # unrelated fragment. JSON mode + shape validation + retry makes the
+    # fallback dependable enough to win the plan-generation race.
+    for attempt in range(3):
+        try:
+            raw = await llm.chat_json(
+                system, user, max_tokens=16000, temperature=0.2,
+                response_format_json=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            logger.warning("LLM experiment planning attempt %d failed: %s", attempt + 1, e)
+            if attempt < 2:
+                await _asyncio.sleep(1.5 * (attempt + 1))
+            continue
+        # Accept the object directly, or unwrap a common envelope key.
+        plan = raw
+        if isinstance(raw, dict) and not (raw.get("workloads") or raw.get("resources")):
+            for key in ("plan", "experiment_plan", "result", "data", "experiment"):
+                inner = raw.get(key)
+                if isinstance(inner, dict) and (inner.get("workloads") or inner.get("resources")):
+                    plan = inner
+                    break
+        if isinstance(plan, dict) and (plan.get("workloads") or plan.get("resources")) and plan.get("checks"):
+            return plan
+        last_err = LLMError(f"plan missing workloads/checks (keys={list(raw.keys()) if isinstance(raw, dict) else type(raw).__name__})")
+        logger.warning("LLM experiment planning attempt %d returned wrong shape: %s", attempt + 1, last_err)
+        if attempt < 2:
+            await _asyncio.sleep(1.5 * (attempt + 1))
+    raise last_err if last_err else LLMError("LLM experiment planning failed")
 
 
 async def _ask_hermes_for_experiment(
@@ -1821,21 +1847,59 @@ def _extract_container_command(manifest: str) -> str:
     return "\n".join(out_lines)
 
 
-async def _apply_workload(kc_path: str, manifest: str) -> tuple[int, str, str]:
-    cmd = ["kubectl", "--kubeconfig", kc_path, "apply", "-f", "-"]
+async def _kubectl_create(kc_path: str, manifest: str) -> tuple[int, str, str]:
+    cmd = ["kubectl", "--kubeconfig", kc_path, "create", "-f", "-"]
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     try:
-        out_b, err_b = await asyncio.wait_for(
-            proc.communicate(manifest.encode()), timeout=20,
-        )
+        out_b, err_b = await asyncio.wait_for(proc.communicate(manifest.encode()), timeout=30)
         return proc.returncode, out_b.decode(), err_b.decode()
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
-        return -2, "", "kubectl apply timed out"
+        return -2, "", "kubectl create timed out"
+
+
+async def _apply_workload(kc_path: str, manifest: str) -> tuple[int, str, str]:
+    """Create the workload manifests, replacing any pre-existing objects.
+
+    The restricted shared-namespace credential (airw-bot) has create+delete
+    but NOT patch/update, so `kubectl apply` fails ("Forbidden ... applying
+    patch") whenever an object with the same name already exists (e.g. a
+    leftover from a prior run). We therefore delete-then-create each document
+    — both verbs are permitted, and it is idempotent.
+    """
+    try:
+        docs = [d for d in yaml.safe_load_all(manifest) if isinstance(d, dict)]
+    except Exception:
+        docs = []
+    if not docs:
+        # Unparseable — fall back to apply so the error surfaces as before.
+        return await _kubectl_create(kc_path, manifest)
+
+    rc_all, outs, errs = 0, [], []
+    for d in docs:
+        kind = str(d.get("kind", ""))
+        meta = d.get("metadata") or {}
+        name = str(meta.get("name", ""))
+        ns = str(meta.get("namespace", ""))
+        if name and kind:
+            # Idempotent pre-delete (no-op when absent). Uses `delete` which
+            # the credential has; avoids the forbidden patch path.
+            await _kubectl_async(
+                ["--kubeconfig", kc_path, "delete", kind, name,
+                 "-n", ns, "--ignore-not-found=true"],
+                timeout=45,
+            )
+        rc, out, err = await _kubectl_create(kc_path, yaml.safe_dump(d))
+        if out.strip():
+            outs.append(out.strip())
+        if rc != 0 and err.strip():
+            errs.append(err.strip())
+            rc_all = rc
+    return rc_all, "\n".join(outs), "\n".join(errs)
 
 
 def _is_namespace_forbidden(err: str) -> bool:
